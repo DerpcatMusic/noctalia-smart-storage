@@ -1,0 +1,14 @@
+# Noctalia plugin source catalog. One [[plugin]] row per plugin subdirectory; plugin.toml stays authoritative.
+[[plugin]]
+id = "derpcat/smart-storage"
+name = "Smart Storage"
+version = "2.1.0"
+updated_at = 1790080187
+added_at = 1790080187
+author = "derpcat"
+license = "MIT"
+icon = "database"
+description = "Storage cleaner: dev caches, builds, worktrees, logs, duplicates — live-use checks, pie chart, recoverable staging."
+plugin_api = 9
+tags = ["panel", "bar", "system", "utility", "development"]
+dependencies = ["python3", "sudo", "findmnt"]

@@ -6,6 +6,7 @@ from pathlib import Path
 HOME = Path.home()
 STATE = HOME / '.local/state/smart-storage'
 CONFIG = STATE / 'config.json'
+HELPER = '/usr/local/libexec/smart-storage-'  # root helpers, see install.sh
 DAY = 86400
 LABELS = {'packages':'AUR package downloads', 'javascript':'Bun / npm caches',
           'python':'Python / pip / uv caches', 'rust':'Rust / compiler caches',
@@ -19,13 +20,12 @@ TOOLS = {
  'rust': {'cargo','rustc','sccache','rustup','clang','gcc','cc','cmake','ninja','make'},
  'builds': {'cargo','rustc','clang','gcc','cc','cmake','ninja','make'},
  'desktop': {'steam','gamescope'}, 'logs': set(), 'worktrees': set(), 'branches': set(), 'temp': set(), 'trash':set(), 'apps':set(), 'redundant':set()}
-DEFAULT = {'age_days':0, 'schedule_days':0, 'categories':[x for x in LABELS if x not in ('trash','worktrees','branches','apps','redundant')], 'pins':[], 'mode':'stage'}
-DEV_ROOTS = [HOME/'projects', HOME/'Projects', HOME/'actions-runners', HOME/'.t3/worktrees', HOME/'src', HOME/'.codex/worktrees',
-             Path('/mnt/Windows11/DEV_PROJECTS'), Path('/mnt/Windows11/DEV_WORKSPACE/BuildScratch')]
+DEFAULT = {'age_days':0, 'schedule_days':0, 'categories':[x for x in LABELS if x not in ('trash','worktrees','branches','apps','redundant')], 'pins':[], 'mode':'stage',
+           'roots':[]}  # roots: extra project directories to walk for build outputs, worktrees and branches (config.json only)
+DEV_ROOTS = [HOME/d for d in ('projects','Projects','src','dev','code','repos','work','actions-runners','.t3/worktrees','.codex/worktrees')]
 EXCLUDE = {'.git','node_modules','.venv','venv','vendor','.smart-storage-recovery'}
 LOG_BASES = [HOME/'.cache', HOME/'.config', HOME/'.local/share', HOME/'.local/state']
 LOG_NAME = re.compile(r'\.log(\.|$)')
-STEAM_APPS = [Path('/mnt/Gaming/SteamLibrary/steamapps'), HOME/'.local/share/Steam/steamapps']
 COLORS = ['mPrimary','mSecondary','mTertiary','mError']
 BACKUP = re.compile(r'backup|[-_.]bak(?![a-z])|\.old$|\.orig$|~$|[-_.]old$|\.bkp', re.I)
 VERSION = re.compile(r'^(.*?)[-_.]?v?(\d+(?:\.\d+)+)(.*)$')
@@ -60,10 +60,13 @@ def config():
         raise ValueError('Unknown cleanup category')
     if not isinstance(c['pins'], list) or any(not isinstance(x,str) for x in c['pins']):
         raise ValueError('Invalid pins')
+    if not isinstance(c['roots'], list) or any(not (isinstance(x,str) and x.startswith('/')) for x in c['roots']):
+        raise ValueError('Invalid roots')
     return c
 
 def probe():
-    result = subprocess.run(['/usr/bin/sudo','-n','/usr/local/libexec/smart-storage-probe'],
+    if not os.path.exists(HELPER+'probe'): raise ValueError('Root helpers not installed: run install.sh from the plugin directory')
+    result = subprocess.run(['/usr/bin/sudo','-n',HELPER+'probe'],
                             capture_output=True, text=True, timeout=45, check=True)
     p = json.loads(result.stdout)
     p['refs'] = {tuple(r) for r in p['refs']}
@@ -124,10 +127,17 @@ def branch_items(repo):
                       'detail':f"{'merged into '+base if is_merged else 'unmerged'} · {idle}d since last commit · {repo.name}"})
     return items
 
+def steam_apps():
+    libs = [HOME/'.local/share/Steam', HOME/'.steam/steam']
+    for f in [l/'steamapps/libraryfolders.vdf' for l in libs]:
+        try: libs += [Path(p) for p in re.findall(r'"path"\s+"([^"]+)"', f.read_text(errors='replace'))]
+        except OSError: pass
+    return sorted({l.resolve()/'steamapps' for l in libs if l.is_dir()})
+
 _steam = {}
 def steam_name(appid):
     if not _steam:
-        for base in STEAM_APPS:
+        for base in steam_apps():
             for f in (base.glob('appmanifest_*.acf') if base.is_dir() else ()):
                 try: m = re.search(r'"name"\s+"([^"]*)"', f.read_text(errors='replace'))
                 except OSError: continue
@@ -327,7 +337,7 @@ def candidates():
       'javascript':[HOME/'.npm/_cacache',HOME/'.bun/install/cache',HOME/'.local/share/pnpm/store',HOME/'.cache/pnpm',HOME/'.npm/_npx',HOME/'.cache/node-gyp'],
       'python':[HOME/'.cache/pip',HOME/'.cache/uv'],
       'rust':[HOME/'.cache/sccache',HOME/'.cache/go-build',HOME/'.cargo/registry/cache',HOME/'.cargo/registry/src'],
-      'desktop':[HOME/'.cache/thumbnails',HOME/'.cache/mesa_shader_cache',HOME/'.local/share/Steam/steamapps/shadercache'],
+      'desktop':[HOME/'.cache/thumbnails',HOME/'.cache/mesa_shader_cache',*[a/'shadercache' for a in steam_apps()]],
       'apps':[HOME/'.config/google-chrome/OptGuideOnDeviceModel',HOME/'.cache/google-chrome',HOME/'.cache/google-chrome-headless',
               HOME/'.cache/google-chrome-for-testing-headless',HOME/'.cache/zen',HOME/'.cache/spotify',HOME/'.cache/winetricks',
               HOME/'.cache/thunderbird',HOME/'.cache/codex-desktop',HOME/'.prime/agent/session-artifacts',HOME/'.cache/buffr/capture',
@@ -371,7 +381,7 @@ def candidates():
         if d.is_dir() and not d.is_symlink(): yield d, 'logs'
     for p in HOME.glob('.codex/*target*'):
         if p.is_dir() and not p.is_symlink() and cargo_target(p): yield p, 'builds'
-    for base in DEV_ROOTS:
+    for base in DEV_ROOTS + [Path(x) for x in config()['roots']]:
         if not base.is_dir():
             continue
         for directory, dirs, files in os.walk(base, followlinks=False):
@@ -431,7 +441,7 @@ def scan():
     c, live, items = config(), probe(), []
     PREVIOUS.update({x['path']:x for x in read(STATE/'report.json',{}).get('items',[]) if x['category']=='worktrees'})
     try:
-        system=json.loads(subprocess.check_output(['/usr/bin/sudo','-n','/usr/local/libexec/smart-storage-system','preview'],text=True,timeout=30))
+        system=json.loads(subprocess.check_output(['/usr/bin/sudo','-n',HELPER+'system','preview'],text=True,timeout=30))
         write(STATE/'system.json',system)
     except (subprocess.SubprocessError,ValueError):
         pass
@@ -652,11 +662,11 @@ def summary(report):
             'history':report.get('history',[]),'last_action':read(STATE/'last-action.json',{}),
             'process_errors':report.get('process_errors',[]),'mounts':mounts(),
             'explorer':read(STATE/'explorer.json',{}),
-            'all_mounts':read(STATE/'all-mounts.json',{}),'system':read(STATE/'system.json',{}),'vm':read(STATE/'vm-usage.json',{})}
+            'all_mounts':read(STATE/'all-mounts.json',{}),'system':read(STATE/'system.json',{})}
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=['scan','status','stage','purge','restore','configure','auto','start','delete','explore','all-mounts','clean-temp','system','vm-clean'])
+    parser.add_argument('action',choices=['scan','status','stage','purge','restore','configure','auto','start','delete','explore','all-mounts','clean-temp','system'])
     parser.add_argument('--operation',choices=['scan','stage','purge','restore','configure','delete','explore','all-mounts','system'])
     parser.add_argument('--path',default='/')
     parser.add_argument('--kind',choices=['packages','packages-all','snapshots','temp','journal'])
@@ -723,36 +733,13 @@ def main():
         elif args.action=='scan': report=scan()
         elif args.action=='system':
             if not args.kind: raise ValueError('Missing system action')
-            result=subprocess.run(['/usr/bin/pkexec','/usr/local/libexec/smart-storage-system',args.kind],
+            result=subprocess.run(['/usr/bin/pkexec',HELPER+'system',args.kind],
                                   capture_output=True,text=True,timeout=1200)
             write(STATE/'system-result.json',{'returncode':result.returncode,'output':result.stdout,'error':result.stderr})
             if result.returncode: raise ValueError(result.stdout or result.stderr or 'Administrator authorization cancelled')
-            preview=subprocess.check_output(['/usr/bin/sudo','-n','/usr/local/libexec/smart-storage-system','preview'],text=True)
+            preview=subprocess.check_output(['/usr/bin/sudo','-n',HELPER+'system','preview'],text=True)
             write(STATE/'system.json',json.loads(preview))
             report=scan()
-        elif args.action=='vm-clean':
-            policy=read(STATE/'vm-policy.json',{})
-            base=Path(policy['root'])
-            live=probe()
-            if any(n.startswith('qemu') or n.startswith('reims') for n in live['names']):
-                raise ValueError('VM processes are running; stopped')
-            # Only this session's explicitly approved extra artifacts; never guest disks.
-            items=[]
-            for value in policy['approved_extras']:
-                path=Path(value)
-                if not under(str(path),str(base)) or path==base: raise ValueError('Invalid VM policy')
-                if path.exists(): items.append(inventory(path,live,config()|{'age_days':0},'temp'))
-            removed=[]
-            for old in items:
-                p=Path(old['path'])
-                now=inventory(p,probe(),config()|{'age_days':0},'temp')
-                if not now['eligible'] or now['fingerprint']!=old['fingerprint']: continue
-                if p.is_dir(): shutil.rmtree(p)
-                else:p.unlink()
-                removed.append(str(p))
-                write(STATE/'vm-cleanup.json',{'removed':removed,'at':time.time()})
-            total=int(subprocess.check_output(['/usr/bin/du','-sx','-B1',str(base)],text=True).split()[0])
-            write(STATE/'vm-usage.json',{'bytes':total,'cap_bytes':policy['cap_bytes'],'within_budget':total<=policy['cap_bytes'],'retained':policy['retained_vms']})
         elif args.action=='clean-temp':
             rules=config() | {'age_days':1,'categories':['temp']}
             live=probe()
@@ -768,7 +755,7 @@ def main():
             paths=[args.path] if args.action=='explore' else [m['target'] for m in mounts() if m['scan']]
             results=[]
             for path in paths:
-                result=subprocess.run(['/usr/bin/sudo','-n','/usr/local/libexec/smart-storage-usage',path],
+                result=subprocess.run(['/usr/bin/sudo','-n',HELPER+'usage',path],
                                       capture_output=True,text=True,timeout=1200,check=True)
                 results.append(json.loads(result.stdout))
             write(STATE/('explorer.json' if args.action=='explore' else 'all-mounts.json'),
