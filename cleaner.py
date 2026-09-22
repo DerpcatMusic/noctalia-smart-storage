@@ -10,15 +10,16 @@ DAY = 86400
 LABELS = {'packages':'AUR package downloads', 'javascript':'Bun / npm caches',
           'python':'Python / pip / uv caches', 'rust':'Rust / compiler caches',
           'builds':'Rust build outputs', 'desktop':'Thumbnails / shaders', 'logs':'Application logs',
-          'worktrees':'Git worktrees (merged, clean)', 'branches':'Stale git branches', 'temp':'Temporary files', 'trash':'Trash / recycle bins'}
+          'worktrees':'Git worktrees (merged, clean)', 'branches':'Stale git branches', 'temp':'Temporary files', 'trash':'Trash / recycle bins',
+          'apps':'App caches (opt-in)'}
 TOOLS = {
  'packages': {'pacman','paru','yay','shelly','makepkg','bsdtar'},
  'javascript': {'bun','npm','pnpm','yarn'},
  'python': {'pip','pip3','uv'},
  'rust': {'cargo','rustc','sccache','rustup','clang','gcc','cc','cmake','ninja','make'},
  'builds': {'cargo','rustc','clang','gcc','cc','cmake','ninja','make'},
- 'desktop': {'steam','gamescope'}, 'logs': set(), 'worktrees': set(), 'branches': set(), 'temp': set(), 'trash':set()}
-DEFAULT = {'age_days':0, 'schedule_days':0, 'categories':[x for x in LABELS if x not in ('trash','worktrees','branches')], 'pins':[], 'mode':'stage'}
+ 'desktop': {'steam','gamescope'}, 'logs': set(), 'worktrees': set(), 'branches': set(), 'temp': set(), 'trash':set(), 'apps':set()}
+DEFAULT = {'age_days':0, 'schedule_days':0, 'categories':[x for x in LABELS if x not in ('trash','worktrees','branches','apps')], 'pins':[], 'mode':'stage'}
 DEV_ROOTS = [HOME/'projects', HOME/'Projects', HOME/'actions-runners', HOME/'.t3/worktrees', HOME/'src', HOME/'.codex/worktrees',
              Path('/mnt/Windows11/DEV_PROJECTS'), Path('/mnt/Windows11/DEV_WORKSPACE/BuildScratch')]
 EXCLUDE = {'.git','node_modules','.venv','venv','vendor','.smart-storage-recovery'}
@@ -126,12 +127,31 @@ def steam_name(appid):
                 if m: _steam[f.stem.split('_',1)[1]] = m.group(1)
     return _steam.get(appid, 'app '+appid)
 
+def cargo_target(p):
+    # cargo writes .rustc_info.json at the target root and .fingerprint under each profile; CI targets lack CACHEDIR.TAG
+    try:
+        if not (p/'.rustc_info.json').is_file(): return False
+        if (p/'CACHEDIR.TAG').read_text().startswith('Signature: 8a477f597d28d172789f06886806bc55'): return True
+    except (OSError,UnicodeError): pass
+    try:
+        return any(e.is_dir() and os.path.isdir(os.path.join(e.path,'.fingerprint')) for e in os.scandir(p))
+    except OSError: return False
+
 def describe(path, category, item):
     s, name, parent = str(path), path.name, path.parent.name.lstrip('.')
     age = f"{idle_days(item['latest'])}d since last change"
     if category=='rust':
+        if parent=='src': return 'extracted crate sources · cargo re-extracts on build · '+age
         return {'sccache':'sccache compiler cache','go-build':'Go build cache','cache':'crates.io downloads'}.get(path.name,path.name)+' · regenerates on next build · '+age
-    if category=='javascript': return ('npm' if '/.npm/' in s else 'bun')+' package cache · re-downloaded on install · '+age
+    if category=='javascript':
+        tool = 'npm' if '/.npm/' in s else 'pnpm' if 'pnpm' in s else 'node-gyp' if 'node-gyp' in s else 'bun'
+        return tool+' package cache · re-downloaded on install · '+age
+    if category=='apps':
+        for needle, what in (('OptGuideOnDeviceModel','Chrome on-device AI model · re-downloaded if the feature is used'),
+                             ('buffr/capture','BUFFR capture spill buffers'), ('session-artifacts','Prime agent session artifacts'),
+                             ('winetricks','winetricks download cache · re-downloaded'), ('.var/app','flatpak app cache')):
+            if needle in s: return f"{what} · {item['files']} files · {age}"
+        return f"{parent} cache · regenerates · {age}"
     if category=='python': return parent+' cache · re-downloaded on install · '+age
     if category=='desktop':
         if parent=='shadercache': return 'Steam shader cache · '+steam_name(name)+' · rebuilt while playing · '+age
@@ -139,12 +159,16 @@ def describe(path, category, item):
     if category=='builds':
         profiles = sorted(d.name for d in os.scandir(path) if d.is_dir() and not d.name.startswith('.'))
         kind = 'dev build' if 'debug' in profiles else 'release build' if 'release' in profiles else 'build'
+        if not (path/'.rustc_info.json').exists() and any(cargo_target(path/d) for d in profiles):
+            return f"CI build workspace of {path.parent.name} · {len(profiles)} targets · CI rebuilds · {age}"
         return f"Cargo target of {path.parent.name} · {kind} ({', '.join(profiles[:4])}) · cargo build recreates · {age}"
     if category=='logs':
         if path.is_dir(): return f"log folder of {parent} · {item['files']} files · {age}"
         return ('rotated' if re.search(r'\.log\.|\.old$',name) else 'current')+f' log file of {parent} · {age}'
     if category=='packages': return 'built package archive · reinstall re-downloads · '+age
-    if category=='temp': return ('folder' if path.is_dir() else 'file')+f' in {path.parent} · {age}'
+    if category=='temp':
+        if 'actions-runners' in s: return f'superseded GitHub runner version · {age}'
+        return ('folder' if path.is_dir() else 'file')+f' in {path.parent} · {age}'
     if category=='trash': return ('trashed folder' if path.is_dir() else 'trashed file')+' · '+age
     return ''
 
@@ -228,10 +252,14 @@ def trash_roots():
 def candidates():
     # Only known regenerable caches. Never general .cache, user data or environments.
     roots = {
-      'javascript':[HOME/'.npm/_cacache',HOME/'.bun/install/cache'],
+      'javascript':[HOME/'.npm/_cacache',HOME/'.bun/install/cache',HOME/'.local/share/pnpm/store',HOME/'.cache/pnpm',HOME/'.npm/_npx',HOME/'.cache/node-gyp'],
       'python':[HOME/'.cache/pip',HOME/'.cache/uv'],
-      'rust':[HOME/'.cache/sccache',HOME/'.cache/go-build',HOME/'.cargo/registry/cache'],
-      'desktop':[HOME/'.cache/thumbnails',HOME/'.cache/mesa_shader_cache',HOME/'.local/share/Steam/steamapps/shadercache']}
+      'rust':[HOME/'.cache/sccache',HOME/'.cache/go-build',HOME/'.cargo/registry/cache',HOME/'.cargo/registry/src'],
+      'desktop':[HOME/'.cache/thumbnails',HOME/'.cache/mesa_shader_cache',HOME/'.local/share/Steam/steamapps/shadercache'],
+      'apps':[HOME/'.config/google-chrome/OptGuideOnDeviceModel',HOME/'.cache/google-chrome',HOME/'.cache/google-chrome-headless',
+              HOME/'.cache/google-chrome-for-testing-headless',HOME/'.cache/zen',HOME/'.cache/spotify',HOME/'.cache/winetricks',
+              HOME/'.cache/thunderbird',HOME/'.cache/codex-desktop',HOME/'.prime/agent/session-artifacts',HOME/'.cache/buffr/capture',
+              *HOME.glob('.var/app/*/cache')]}
     seen = set()
     def children(p, cat):
         p = p.resolve()
@@ -249,6 +277,9 @@ def candidates():
             yield from children(p, cat)
     for base in (HOME/'.cache/paru/clone',HOME/'.cache/Shelly'):
         if base.is_dir():
+            for clone in base.iterdir():
+                for n in ('src','pkg'):
+                    if (clone/n).is_dir() and not (clone/n).is_symlink() and not clone.is_symlink(): yield clone/n, 'packages'
             for directory, dirs, files in os.walk(base, followlinks=False):
                 dirs[:] = [d for d in dirs if d not in EXCLUDE and d not in ('src','pkg')
                            and not Path(directory,d).is_symlink()]
@@ -263,8 +294,15 @@ def candidates():
                 if (app/name).is_dir() and not (app/name).is_symlink(): yield app/name, 'logs'
             for f in app.iterdir():
                 if LOG_NAME.search(f.name) and f.is_file() and not f.is_symlink(): yield f, 'logs'
-    for d in (HOME/'.npm/_logs', HOME/'.t3/userdata/logs'):
-        if d.is_dir(): yield d, 'logs'
+    for d in (HOME/'.npm/_logs', HOME/'.t3/userdata/logs', *HOME.glob('actions-runners/*/_diag')):
+        if d.is_dir() and not d.is_symlink(): yield d, 'logs'
+    for r in HOME.glob('actions-runners/*'):  # runner self-update leaves the previous bin.X/externals.X behind
+        if (r/'bin').is_symlink():
+            cur = Path(os.readlink(r/'bin')).name.split('.',1)[-1]
+            for d in (*r.glob('bin.*'), *r.glob('externals.*')):
+                if d.is_dir() and not d.is_symlink() and d.name.split('.',1)[-1] != cur: yield d, 'temp'
+    for p in HOME.glob('.codex/*target*'):
+        if p.is_dir() and not p.is_symlink() and cargo_target(p): yield p, 'builds'
     for base in DEV_ROOTS:
         if not base.is_dir():
             continue
@@ -278,15 +316,10 @@ def candidates():
                 if gitdir.startswith('gitdir: ') and '/.git/worktrees/' in gitdir:
                     yield p, 'worktrees'  # keep walking: build outputs inside are separate items
             dirs[:] = [d for d in dirs if d not in EXCLUDE and not (p/d).is_symlink()]
-            if '.rustc_info.json' in files and 'CACHEDIR.TAG' in files:
-                try:
-                    tagged = (p/'CACHEDIR.TAG').read_text().startswith('Signature: 8a477f597d28d172789f06886806bc55')
-                except (OSError,UnicodeError):
-                    tagged = False
-                if tagged and str(p) not in seen:
-                    seen.add(str(p))
-                    yield p, 'builds'
-                    dirs[:] = []
+            if str(p) not in seen and (cargo_target(p) or (p.name.startswith('target') and any(cargo_target(p/d) for d in dirs))):
+                seen.add(str(p))
+                yield p, 'builds'
+                dirs[:] = []
             # Bound traversal to the explicitly identified development trees.
     for base in (Path('/tmp'),Path('/var/tmp'),HOME/'tmp'):
         if base.is_dir():
