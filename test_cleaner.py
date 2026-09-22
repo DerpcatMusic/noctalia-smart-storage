@@ -9,3 +9,7 @@ assert cleaner.LOG_NAME.search('launcher.log') and cleaner.LOG_NAME.search('x.lo
 assert cleaner.png(1,[b'\0\0\0\0'])[:8] == b'\x89PNG\r\n\x1a\n'
 assert set(cleaner.DEFAULT['categories']).isdisjoint({'trash','worktrees','branches'})
 print('ok')
+
+assert cleaner.BACKUP.search('buffr-drafts-backup-20260824') and cleaner.BACKUP.search('settings.toml.bak-x') and not cleaner.BACKUP.search('bakery')
+m = cleaner.VERSION.match('bin.2.336.0'); assert m.group(1)=='bin' and m.group(2)=='2.336.0'
+m = cleaner.VERSION.match('ElementalWarrior-wine-11.12-v4'); assert m.group(2)=='11.12' and m.group(3)=='-v4'

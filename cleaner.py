@@ -11,15 +11,15 @@ LABELS = {'packages':'AUR package downloads', 'javascript':'Bun / npm caches',
           'python':'Python / pip / uv caches', 'rust':'Rust / compiler caches',
           'builds':'Rust build outputs', 'desktop':'Thumbnails / shaders', 'logs':'Application logs',
           'worktrees':'Git worktrees (merged, clean)', 'branches':'Stale git branches', 'temp':'Temporary files', 'trash':'Trash / recycle bins',
-          'apps':'App caches (opt-in)'}
+          'apps':'App caches (opt-in)', 'redundant':'Duplicates / old versions / backups (opt-in)'}
 TOOLS = {
  'packages': {'pacman','paru','yay','shelly','makepkg','bsdtar'},
  'javascript': {'bun','npm','pnpm','yarn'},
  'python': {'pip','pip3','uv'},
  'rust': {'cargo','rustc','sccache','rustup','clang','gcc','cc','cmake','ninja','make'},
  'builds': {'cargo','rustc','clang','gcc','cc','cmake','ninja','make'},
- 'desktop': {'steam','gamescope'}, 'logs': set(), 'worktrees': set(), 'branches': set(), 'temp': set(), 'trash':set(), 'apps':set()}
-DEFAULT = {'age_days':0, 'schedule_days':0, 'categories':[x for x in LABELS if x not in ('trash','worktrees','branches','apps')], 'pins':[], 'mode':'stage'}
+ 'desktop': {'steam','gamescope'}, 'logs': set(), 'worktrees': set(), 'branches': set(), 'temp': set(), 'trash':set(), 'apps':set(), 'redundant':set()}
+DEFAULT = {'age_days':0, 'schedule_days':0, 'categories':[x for x in LABELS if x not in ('trash','worktrees','branches','apps','redundant')], 'pins':[], 'mode':'stage'}
 DEV_ROOTS = [HOME/'projects', HOME/'Projects', HOME/'actions-runners', HOME/'.t3/worktrees', HOME/'src', HOME/'.codex/worktrees',
              Path('/mnt/Windows11/DEV_PROJECTS'), Path('/mnt/Windows11/DEV_WORKSPACE/BuildScratch')]
 EXCLUDE = {'.git','node_modules','.venv','venv','vendor','.smart-storage-recovery'}
@@ -27,6 +27,13 @@ LOG_BASES = [HOME/'.cache', HOME/'.config', HOME/'.local/share', HOME/'.local/st
 LOG_NAME = re.compile(r'\.log(\.|$)')
 STEAM_APPS = [Path('/mnt/Gaming/SteamLibrary/steamapps'), HOME/'.local/share/Steam/steamapps']
 COLORS = ['mPrimary','mSecondary','mTertiary','mError']
+BACKUP = re.compile(r'backup|[-_.]bak(?![a-z])|\.old$|\.orig$|~$|[-_.]old$|\.bkp', re.I)
+VERSION = re.compile(r'^(.*?)[-_.]?v?(\d+(?:\.\d+)+)(.*)$')
+ARCHIVES = ('.tar.xz','.tar.gz','.tar.zst','.tar.bz2','.tgz','.zip','.7z','.dmg','.tar')
+SKIP = {'.git','node_modules','.cache','.rustup','.cargo','flatpak','containers','Steam','.var','.smart-storage-recovery',
+        '.venv','venv','target','__pycache__','.snapshots','externals','_update','registry','toolchains','rustup','cargo','.expo'}
+INSTALLED = re.compile(r'/drive_c/(windows|ProgramData|Program Files( \(x86\))?|users/[^/]+/AppData)$')  # installed software, not user copies
+BIG = 64<<20
 PREVIOUS = {}  # last report's worktree rows; ineligible worktrees reuse their size while git state is unchanged
 
 def read(path, default):
@@ -137,6 +144,72 @@ def cargo_target(p):
         return any(e.is_dir() and os.path.isdir(os.path.join(e.path,'.fingerprint')) for e in os.scandir(p))
     except OSError: return False
 
+def sample(path, size):
+    # ponytail: 3 MB sampled hash, not a full read; detail says "(sampled)". Full hash if a false match ever shows up.
+    h = hashlib.sha256()
+    with open(path,'rb') as f:
+        for off in (0, size//2, max(0,size-(1<<20))):
+            f.seek(off); h.update(f.read(1<<20))
+    return h.hexdigest()
+
+def redundant(live, c):
+    """Backup-named entries, older versioned siblings, archives already extracted beside them, same-content large files."""
+    notes, bysize, stack = {}, {}, [str(HOME)]
+    while stack:  # ponytail: full home walk each scan (~4 s warm, 70 s cold); cache by dir mtime if it hurts
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it: entries = list(it)
+        except OSError: continue
+        names, links, groups = {e.name for e in entries}, set(), {}
+        for e in entries:
+            if e.is_symlink():
+                try: links.add(os.path.basename(os.readlink(e.path)))
+                except OSError: pass
+        for e in entries:
+            if e.is_symlink(): continue
+            p, isdir = e.path, e.is_dir(follow_symlinks=False)
+            if BACKUP.search(e.name):
+                notes[p] = 'backup by name'
+                continue
+            m = VERSION.match(e.name)
+            if m and m.group(1):
+                groups.setdefault((m.group(1),m.group(3),isdir),[]).append((tuple(int(x) for x in m.group(2).split('.')),e))
+            if isdir:
+                if e.name not in SKIP and not e.name.startswith('externals') and not INSTALLED.search(p): stack.append(p)
+                continue
+            for suf in ARCHIVES:
+                if e.name.endswith(suf) and e.name[:-len(suf)] in names:
+                    notes[p] = f'archive already extracted to {e.name[:-len(suf)]}/'
+            try: st = e.stat(follow_symlinks=False)
+            except OSError: continue
+            if stat.S_ISREG(st.st_mode) and st.st_size >= BIG: bysize.setdefault(st.st_size,[]).append((p,st))
+        for members in groups.values():
+            if len(members) < 2: continue
+            current = next((e for _,e in members if e.name in links), max(members)[1])
+            for _,e in members:
+                if e is not current and e.path not in notes:
+                    notes[e.path] = f'older version · current is {current.name}'
+                    if e.path in stack: stack.remove(e.path)
+    for size, files in bysize.items():
+        distinct = {(st.st_dev,st.st_ino):(p,st) for p,st in files}
+        if len(distinct) < 2: continue
+        byhash = {}
+        for p,st in distinct.values():
+            try: byhash.setdefault(sample(p,size),[]).append((p,st))
+            except OSError: pass
+        for same in byhash.values():
+            same.sort(key=lambda x:x[1].st_mtime)
+            for p,_ in same[1:]: notes[p] = f'same content as {same[0][0].replace(str(HOME),"~")} (sampled)'
+    items = []
+    for p, note in sorted(notes.items()):
+        if any(under(p, str(x)) for x in notes if x != p): continue
+        try:
+            it = inventory(Path(p), live, c, 'redundant')
+        except (OSError,ValueError): continue
+        it['detail'] = f"{note} · {idle_days(it['latest'])}d since last change"
+        items.append(it)
+    return items
+
 def describe(path, category, item):
     s, name, parent = str(path), path.name, path.parent.name.lstrip('.')
     age = f"{idle_days(item['latest'])}d since last change"
@@ -167,7 +240,6 @@ def describe(path, category, item):
         return ('rotated' if re.search(r'\.log\.|\.old$',name) else 'current')+f' log file of {parent} · {age}'
     if category=='packages': return 'built package archive · reinstall re-downloads · '+age
     if category=='temp':
-        if 'actions-runners' in s: return f'superseded GitHub runner version · {age}'
         return ('folder' if path.is_dir() else 'file')+f' in {path.parent} · {age}'
     if category=='trash': return ('trashed folder' if path.is_dir() else 'trashed file')+' · '+age
     return ''
@@ -297,11 +369,6 @@ def candidates():
                 if LOG_NAME.search(f.name) and f.is_file() and not f.is_symlink(): yield f, 'logs'
     for d in (HOME/'.npm/_logs', HOME/'.t3/userdata/logs', *HOME.glob('actions-runners/*/_diag')):
         if d.is_dir() and not d.is_symlink(): yield d, 'logs'
-    for r in HOME.glob('actions-runners/*'):  # runner self-update leaves the previous bin.X/externals.X behind
-        if (r/'bin').is_symlink():
-            cur = Path(os.readlink(r/'bin')).name.split('.',1)[-1]
-            for d in (*r.glob('bin.*'), *r.glob('externals.*')):
-                if d.is_dir() and not d.is_symlink() and d.name.split('.',1)[-1] != cur: yield d, 'temp'
     for p in HOME.glob('.codex/*target*'):
         if p.is_dir() and not p.is_symlink() and cargo_target(p): yield p, 'builds'
     for base in DEV_ROOTS:
@@ -328,6 +395,7 @@ def candidates():
                 if (not p.name.startswith('.') and p.name != '.smart-storage-recovery'
                         and p.lstat().st_uid == os.getuid() and not p.is_symlink()):
                     yield p, 'temp'
+    yield HOME, 'redundant'  # pseudo-category: scan() expands it via redundant()
 
 def mounts():
     rows=json.loads(subprocess.check_output(['/usr/bin/findmnt','--json','--list',
@@ -369,7 +437,7 @@ def scan():
         pass
     def one(p, category):
         try:
-            return branch_items(p) if category=='repo' else [inventory(p, live, c, category)]
+            return branch_items(p) if category=='repo' else redundant(live, c) if category=='redundant' else [inventory(p, live, c, category)]
         except (OSError,ValueError,subprocess.SubprocessError) as e:
             return [] if category=='repo' else [{'id':key(p),'path':str(p),'category':category,'bytes':0,'files':0,'latest':0,
                           'detail':'','reason':'Unreadable or changed: '+type(e).__name__,'eligible':False}]
@@ -414,7 +482,7 @@ def stage(report, permanent=False, rules=None, ids=None):
                 if r.returncode: raise ValueError(r.stderr.strip() or 'git branch -d failed')
                 result['deleted'] += 1
                 continue
-            if allowed.get(str(p)) != old['category'] or not p.exists():
+            if not p.exists() or (allowed.get(str(p)) != old['category'] if old['category']!='redundant' else not under(str(p),str(HOME))):
                 result['skipped'] += 1
                 continue
             now = inventory(p,live,c,old['category'])
@@ -566,7 +634,7 @@ def shade(hexcolor, k):
 def summary(report):
     c = config()
     theme = read(HOME/'.config/noctalia/colors.json',{})
-    palette = [shade(theme.get(name,'#8899aa'),k) for k in (0,-0.35,0.4) for name in COLORS]
+    palette = [shade(theme.get(name,'#8899aa'),k) for k in (0,-0.35,0.4,-0.6) for name in COLORS]
     items = aged(report.get('items',[]), c)
     groups, shown, per = [], [], {}
     for i,(cat,label) in enumerate(LABELS.items()):

@@ -41,6 +41,7 @@ Validation: Python compilation, native plugin lint, Lua syntax check, and tempor
 ## 2.0 — categories, worktrees, branches, pie
 
 - New categories: application logs, git worktrees (removed only when clean and merged, via `git worktree remove`), stale branches (`git branch -d`, merged only).
+- Opt-in categories: app caches (Chrome on-device model, Bitwig undo history, Steam-like app caches) and *Duplicates / old versions / backups* — a home walk that flags `*backup*`/`.bak`/`.old` names, older versioned siblings (`foo-1.0.34` next to `foo-1.0.40`, symlink-aware), archives already extracted beside them, and same-content files ≥ 64 MB (sampled hash). Each item says why and what the current copy is.
 - Every item carries a `detail` line (cache type, Steam game, Cargo profile, branch state).
 - Per-item removal from the panel; settings changes never trigger a rescan.
 - The system journal action needs the updated root helper (run once, asks for your password):
