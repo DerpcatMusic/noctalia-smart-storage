@@ -37,3 +37,14 @@ Only Reims macOS and the hardware-accelerated Win11 guest remain, plus their req
 The previous `storage-sweep`, `build-reaper`, `targone-sweep`, `tmp-reap` user timers and `derpcat-clean-storage` system timer were disabled to avoid overlapping automatic deletion. Their original scripts/units were preserved.
 
 Validation: Python compilation, native plugin lint, Lua syntax check, and temporary-fixture checks for permanent deletion, link-target survival, active executable protection, stale-preview rejection and recovery restoration passed. The panel uses bounded content dimensions and a single scrolling body; it is not opened automatically.
+
+## 2.0 — categories, worktrees, branches, pie
+
+- New categories: application logs, git worktrees (removed only when clean and merged, via `git worktree remove`), stale branches (`git branch -d`, merged only).
+- Every item carries a `detail` line (cache type, Steam game, Cargo profile, branch state).
+- Per-item removal from the panel; settings changes never trigger a rescan.
+- The system journal action needs the updated root helper (run once, asks for your password):
+
+```bash
+sudo install -m755 ~/.local/share/noctalia/plugins/smart-storage/system.py /usr/local/libexec/smart-storage-system
+```
