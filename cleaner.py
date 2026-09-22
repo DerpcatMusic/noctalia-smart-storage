@@ -557,7 +557,7 @@ def main():
     parser.add_argument('action',choices=['scan','status','stage','purge','restore','configure','auto','start','delete','explore','all-mounts','clean-temp','system','vm-clean'])
     parser.add_argument('--operation',choices=['scan','stage','purge','restore','configure','delete','explore','all-mounts','system'])
     parser.add_argument('--path',default='/')
-    parser.add_argument('--kind',choices=['packages','packages-all','snapshots','temp'])
+    parser.add_argument('--kind',choices=['packages','packages-all','snapshots','temp','journal'])
     parser.add_argument('--mode',choices=['stage','delete'])
     parser.add_argument('--age',type=int,choices=[0,1,7,30,90])
     parser.add_argument('--schedule',type=int,choices=[0,1,7,30])
