@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """Smart Storage: explicit disposable roots, live-use checks and reversible staging."""
-import argparse, fcntl, hashlib, json, os, shutil, stat, subprocess, sys, time, uuid
+import argparse, concurrent.futures, fcntl, hashlib, json, math, os, re, shutil, stat, struct, subprocess, sys, time, uuid, zlib
 from pathlib import Path
 
 HOME = Path.home()
@@ -9,18 +9,24 @@ CONFIG = STATE / 'config.json'
 DAY = 86400
 LABELS = {'packages':'AUR package downloads', 'javascript':'Bun / npm caches',
           'python':'Python / pip / uv caches', 'rust':'Rust / compiler caches',
-          'builds':'Rust build outputs', 'desktop':'Thumbnails / shaders', 'temp':'Temporary files', 'trash':'Trash / recycle bins'}
+          'builds':'Rust build outputs', 'desktop':'Thumbnails / shaders', 'logs':'Application logs',
+          'worktrees':'Git worktrees (merged, clean)', 'branches':'Stale git branches', 'temp':'Temporary files', 'trash':'Trash / recycle bins'}
 TOOLS = {
  'packages': {'pacman','paru','yay','shelly','makepkg','bsdtar'},
  'javascript': {'bun','npm','pnpm','yarn'},
  'python': {'pip','pip3','uv'},
  'rust': {'cargo','rustc','sccache','rustup','clang','gcc','cc','cmake','ninja','make'},
  'builds': {'cargo','rustc','clang','gcc','cc','cmake','ninja','make'},
- 'desktop': {'steam','gamescope'}, 'temp': set(), 'trash':set()}
-DEFAULT = {'age_days':0, 'schedule_days':0, 'categories':[x for x in LABELS if x!='trash'], 'pins':[], 'mode':'stage'}
-DEV_ROOTS = [HOME/'projects', HOME/'Projects', HOME/'actions-runners', HOME/'.t3/worktrees', HOME/'src',
+ 'desktop': {'steam','gamescope'}, 'logs': set(), 'worktrees': set(), 'branches': set(), 'temp': set(), 'trash':set()}
+DEFAULT = {'age_days':0, 'schedule_days':0, 'categories':[x for x in LABELS if x not in ('trash','worktrees','branches')], 'pins':[], 'mode':'stage'}
+DEV_ROOTS = [HOME/'projects', HOME/'Projects', HOME/'actions-runners', HOME/'.t3/worktrees', HOME/'src', HOME/'.codex/worktrees',
              Path('/mnt/Windows11/DEV_PROJECTS'), Path('/mnt/Windows11/DEV_WORKSPACE/BuildScratch')]
 EXCLUDE = {'.git','node_modules','.venv','venv','vendor','.smart-storage-recovery'}
+LOG_BASES = [HOME/'.cache', HOME/'.config', HOME/'.local/share', HOME/'.local/state']
+LOG_NAME = re.compile(r'\.log(\.|$)')
+STEAM_APPS = [Path('/mnt/Gaming/SteamLibrary/steamapps'), HOME/'.local/share/Steam/steamapps']
+COLORS = ['mPrimary','mSecondary','mTertiary','mError']
+PREVIOUS = {}  # last report's worktree rows; ineligible worktrees reuse their size while git state is unchanged
 
 def read(path, default):
     try:
@@ -67,12 +73,88 @@ def kept(path, c):
     return any((p / marker).exists() for p in (path, *path.parents)
                for marker in ('.keepbuild','.keepstorage'))
 
+def git(*args, cwd):
+    return subprocess.run(['/usr/bin/git','-c','core.fsmonitor=false',*args],cwd=cwd,capture_output=True,text=True,timeout=60)
+
+def default_ref(repo):
+    r = git('symbolic-ref','-q','--short','refs/remotes/origin/HEAD',cwd=repo)
+    if r.returncode == 0: return r.stdout.strip()
+    for name in ('main','master'):
+        if git('rev-parse','-q','--verify','refs/heads/'+name,cwd=repo).returncode == 0: return name
+    return ''
+
+def idle_days(ts):
+    return int((time.time()-ts)//DAY) if ts else 0
+
+def worktree_state(path):
+    """Linked worktree: eligible only when clean and HEAD is already in the default branch."""
+    main = str(Path(git('rev-parse','--path-format=absolute','--git-common-dir',cwd=path).stdout.strip()).parent)
+    branch = git('rev-parse','--abbrev-ref','HEAD',cwd=path).stdout.strip() or 'HEAD'
+    dirty = len(git('status','--porcelain','--ignore-submodules',cwd=path).stdout.splitlines())
+    base = default_ref(path)
+    merged = bool(base) and git('merge-base','--is-ancestor','HEAD',base,cwd=path).returncode == 0
+    head, ts = (git('log','-1','--format=%H %ct',cwd=path).stdout.split() or ['',0])[:2]
+    idle = idle_days(int(ts))
+    detail = f"{branch} · {'merged into '+base if merged else 'not merged'} · {idle}d since last commit · {'dirty '+str(dirty) if dirty else 'clean'} · of {Path(main).name}"
+    reason = 'Uncommitted changes' if dirty else '' if merged else 'Not merged into '+(base or 'a default branch')
+    return reason, detail, main, [head, dirty, base]
+
+def branch_items(repo):
+    """Merged branches are deletable (git branch -d); unmerged ones idle 30+ days are listed only."""
+    base = default_ref(repo)
+    if not base: return []
+    merged = set(git('branch','--merged',base,'--format=%(refname:short)',cwd=repo).stdout.split())
+    used = {l.split('/',2)[-1] for l in git('worktree','list','--porcelain',cwd=repo).stdout.splitlines() if l.startswith('branch ')}
+    items = []
+    for line in git('for-each-ref','--format=%(refname:short) %(objectname) %(committerdate:unix)','refs/heads',cwd=repo).stdout.splitlines():
+        name, sha, ts = line.split(); idle = idle_days(int(ts))
+        is_merged = name in merged and name != base.split('/')[-1]
+        if not is_merged and idle < 30: continue
+        reason = 'Checked out in a worktree' if name in used else '' if is_merged else 'Not merged; listed only'
+        items.append({'id':key(f'{repo}#{name}'),'path':f'{repo}#{name}','repo':str(repo),'branch':name,'category':'branches',
+                      'bytes':0,'reclaimable':0,'files':0,'latest':int(ts),'fingerprint':sha,'reason':reason,'eligible':not reason,
+                      'detail':f"{'merged into '+base if is_merged else 'unmerged'} · {idle}d since last commit · {repo.name}"})
+    return items
+
+_steam = {}
+def steam_name(appid):
+    if not _steam:
+        for base in STEAM_APPS:
+            for f in (base.glob('appmanifest_*.acf') if base.is_dir() else ()):
+                try: m = re.search(r'"name"\s+"([^"]*)"', f.read_text(errors='replace'))
+                except OSError: continue
+                if m: _steam[f.stem.split('_',1)[1]] = m.group(1)
+    return _steam.get(appid, 'app '+appid)
+
+def describe(path, category, item):
+    s, name, parent = str(path), path.name, path.parent.name.lstrip('.')
+    age = f"{idle_days(item['latest'])}d since last change"
+    if category=='rust':
+        return {'sccache':'sccache compiler cache','go-build':'Go build cache','cache':'crates.io downloads'}.get(path.name,path.name)+' · regenerates on next build · '+age
+    if category=='javascript': return ('npm' if '/.npm/' in s else 'bun')+' package cache · re-downloaded on install · '+age
+    if category=='python': return parent+' cache · re-downloaded on install · '+age
+    if category=='desktop':
+        if parent=='shadercache': return 'Steam shader cache · '+steam_name(name)+' · rebuilt while playing · '+age
+        return ('Mesa shader cache' if 'mesa' in s else 'thumbnail cache')+' · regenerates · '+age
+    if category=='builds':
+        profiles = sorted(d.name for d in os.scandir(path) if d.is_dir() and not d.name.startswith('.'))
+        kind = 'dev build' if 'debug' in profiles else 'release build' if 'release' in profiles else 'build'
+        return f"Cargo target of {path.parent.name} · {kind} ({', '.join(profiles[:4])}) · cargo build recreates · {age}"
+    if category=='logs':
+        if path.is_dir(): return f"log folder of {parent} · {item['files']} files · {age}"
+        return ('rotated' if re.search(r'\.log\.|\.old$',name) else 'current')+f' log file of {parent} · {age}'
+    if category=='packages': return 'built package archive · reinstall re-downloads · '+age
+    if category=='temp': return ('folder' if path.is_dir() else 'file')+f' in {path.parent} · {age}'
+    if category=='trash': return ('trashed folder' if path.is_dir() else 'trashed file')+' · '+age
+    return ''
+
 def inventory(path, live, c, category):
     """Any uncertainty protects the entire unit; never follows symlinks/mounts."""
     rootstat = path.lstat()
     total, latest, count = 0, 0, 0
     inodes = {}
     digest = hashlib.sha256()
+    uid = os.getuid()
     reason = 'Pinned / keep marker' if kept(path, c) else ''
     if path.resolve() != path:
         reason = 'Symlink ancestor; protected'
@@ -81,42 +163,52 @@ def inventory(path, live, c, category):
     if any(under(p, str(path)) for p in live['paths']):
         reason = 'In use: open file, binary, working directory or argument'
     # Tool-wide guards cover lazily opened cache files, beyond open descriptors.
-    if category != 'builds' and any(n.lower() in TOOLS[category] for n in live['names']):
+    if category not in ('builds','worktrees') and any(n.lower() in TOOLS[category] for n in live['names']):
         reason = 'Protected while related tools are running'
     if category=='builds' and (path.parent/'Cargo.toml').exists() and any(under(p,str(path.parent)) for p in live['paths']):
         reason = 'Project is in use'
-    stack = [path]
-    while stack:
-        p = stack.pop()
-        s = p.lstat()
+    extra = {}
+    if category == 'worktrees':
+        wreason, extra['detail'], extra['main'], extra['state'] = worktree_state(path)
+        reason = reason or wreason
+        old = PREVIOUS.get(str(path))
+        if reason and old and old.get('state') == extra['state']:
+            return old | extra | {'reason':reason,'eligible':False}
+    root = str(path)
+    def note(p, s):
+        nonlocal reason, latest, count
         if s.st_dev != rootstat.st_dev or (stat.S_ISDIR(s.st_mode) and os.path.ismount(p)):
             reason = 'Contains a mount; protected'
-            continue
-        if s.st_uid != os.getuid():
+            return False
+        if s.st_uid != uid:
             reason = 'Not entirely owned by this user'
         if (s.st_dev,s.st_ino) in live['refs']:
             reason = 'In use: open file, mapped binary or working directory'
-        if p.name in ('.keepbuild','.keepstorage'):
+        name = os.path.basename(p)
+        if name in ('.keepbuild','.keepstorage'):
             reason = 'Contains a keep marker'
-        if stat.S_ISLNK(s.st_mode):
-            pass  # rmtree unlinks directory entries and never follows these targets.
-        elif stat.S_ISDIR(s.st_mode):
-            stack.extend(sorted(p.iterdir(), reverse=True))
-        elif not stat.S_ISREG(s.st_mode):
+        link, isdir = stat.S_ISLNK(s.st_mode), stat.S_ISDIR(s.st_mode)
+        if not link and not isdir and not stat.S_ISREG(s.st_mode):
             reason = 'Contains sockets or special files'
-        inode=(s.st_dev,s.st_ino)
-        entry=inodes.setdefault(inode,[s.st_blocks*512,0,s.st_nlink if stat.S_ISREG(s.st_mode) else 1])
+        entry=inodes.setdefault((s.st_dev,s.st_ino),[s.st_blocks*512,0,s.st_nlink if stat.S_ISREG(s.st_mode) else 1])
         entry[1]+=1
         latest = max(latest, s.st_mtime, s.st_ctime)
         count += 1
-        digest.update(os.fsencode(str(p.relative_to(path))))
+        digest.update(os.fsencode(p[len(root)+1:] or '.'))
         digest.update(str((s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns,s.st_mode)).encode())
+        return isdir and not link  # rmtree unlinks symlink entries and never follows their targets.
+    stack = [root] if note(root, rootstat) else []
+    while stack:
+        with os.scandir(stack.pop()) as it:
+            for e in sorted(it, key=lambda e: e.name):
+                if note(e.path, e.stat(follow_symlinks=False)):
+                    stack.append(e.path)
     total=sum(v[0] for v in inodes.values())
     reclaimable=sum(v[0] for v in inodes.values() if v[1]>=v[2])
-    if not reason and time.time()-latest < c['age_days']*DAY:
-        reason = 'Recently changed'
-    return {'id':key(path),'path':str(path),'category':category,'bytes':total,'reclaimable':reclaimable,'files':count,
-            'latest':latest,'fingerprint':digest.hexdigest(),'reason':reason,'eligible':not reason}
+    item = {'id':key(path),'path':str(path),'category':category,'bytes':total,'reclaimable':reclaimable,'files':count,
+            'latest':latest,'fingerprint':digest.hexdigest(),'reason':reason,'eligible':not reason} | extra
+    item.setdefault('detail', describe(path, category, item))
+    return item
 
 def trash_roots():
     roots=[HOME/'.local/share/Trash/files']
@@ -163,11 +255,28 @@ def candidates():
                 for f in files:
                     if ('.pkg.tar.' in f or f.endswith(('.tar.gz','.tar.xz','.tar.zst','.zip','.deb','.rpm','.AppImage'))) and not f.endswith(('.sig','.part','.tmp')):
                         yield Path(directory,f), 'packages'
+    for base in LOG_BASES:
+        if not base.is_dir(): continue
+        for app in base.iterdir():
+            if app.is_symlink() or not app.is_dir(): continue
+            for name in ('logs','log','Logs'):
+                if (app/name).is_dir() and not (app/name).is_symlink(): yield app/name, 'logs'
+            for f in app.iterdir():
+                if LOG_NAME.search(f.name) and f.is_file() and not f.is_symlink(): yield f, 'logs'
+    for d in (HOME/'.npm/_logs', HOME/'.t3/userdata/logs'):
+        if d.is_dir(): yield d, 'logs'
     for base in DEV_ROOTS:
         if not base.is_dir():
             continue
         for directory, dirs, files in os.walk(base, followlinks=False):
             p = Path(directory)
+            if '.git' in dirs:
+                yield p, 'repo'  # pseudo-category: scan() expands it into 'branches' items
+            elif '.git' in files and not (p/'.git').is_symlink():
+                try: gitdir = (p/'.git').read_text()
+                except (OSError,UnicodeError): gitdir = ''
+                if gitdir.startswith('gitdir: ') and '/.git/worktrees/' in gitdir:
+                    yield p, 'worktrees'  # keep walking: build outputs inside are separate items
             dirs[:] = [d for d in dirs if d not in EXCLUDE and not (p/d).is_symlink()]
             if '.rustc_info.json' in files and 'CACHEDIR.TAG' in files:
                 try:
@@ -218,18 +327,22 @@ def recovery():
 
 def scan():
     c, live, items = config(), probe(), []
+    PREVIOUS.update({x['path']:x for x in read(STATE/'report.json',{}).get('items',[]) if x['category']=='worktrees'})
     try:
         system=json.loads(subprocess.check_output(['/usr/bin/sudo','-n','/usr/local/libexec/smart-storage-system','preview'],text=True,timeout=30))
         write(STATE/'system.json',system)
     except (subprocess.SubprocessError,ValueError):
         pass
-    for p, category in candidates():
+    def one(p, category):
         try:
-            items.append(inventory(p, live, c, category))
-        except OSError as e:
-            items.append({'id':key(p),'path':str(p),'category':category,'bytes':0,
-                          'reason':'Unreadable or changed: '+type(e).__name__,'eligible':False})
-    items.sort(key=lambda x:x['bytes'], reverse=True)
+            return branch_items(p) if category=='repo' else [inventory(p, live, c, category)]
+        except (OSError,ValueError,subprocess.SubprocessError) as e:
+            return [] if category=='repo' else [{'id':key(p),'path':str(p),'category':category,'bytes':0,'files':0,'latest':0,
+                          'detail':'','reason':'Unreadable or changed: '+type(e).__name__,'eligible':False}]
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        for rows in pool.map(lambda a: one(*a), list(candidates())):
+            items += rows
+    items.sort(key=lambda x:(x['bytes'],x['latest']), reverse=True)
     report = {'at':time.time(),'config':c,'disks':disks(),'items':items,
               'process_errors':live['errors'],'recovery':recovery(),
               'last_action':read(STATE/'last-action.json',{})}
@@ -242,31 +355,55 @@ def scan():
     write(STATE/'report.json',report)
     return report
 
-def stage(report, permanent=False, rules=None):
+def stage(report, permanent=False, rules=None, ids=None):
     if time.time()-report['at'] > 1800:
         raise ValueError('Preview expired. Scan again before cleaning.')
-    c, records, result = (rules or config()), recovery(), {'staged':0,'bytes':0,'skipped':0,'errors':[]}
+    c, records, result = (rules or config()), recovery(), {'staged':0,'deleted':0,'bytes':0,'skipped':0,'errors':[]}
     allowed = {str(p):cat for p,cat in candidates()}
+    live = probe()
     for old in report['items']:
-        if not old['eligible'] or old['category'] not in c['categories']:
+        if ids is not None:
+            if old['id'] not in ids: continue
+        elif not old['eligible'] or old['category'] not in c['categories']:
+            continue
+        if c['age_days'] and time.time()-old.get('latest',0) < c['age_days']*DAY:
+            result['skipped'] += 1
             continue
         p = Path(old['path'])
         try:
+            if old['category']=='branches':
+                now = next((b for b in branch_items(Path(old['repo'])) if b['branch']==old['branch']),None)
+                if not now or not now['eligible'] or now['fingerprint'] != old['fingerprint']:
+                    result['skipped'] += 1
+                    continue
+                r = git('branch','-d',old['branch'],cwd=old['repo'])
+                if r.returncode: raise ValueError(r.stderr.strip() or 'git branch -d failed')
+                result['deleted'] += 1
+                continue
             if allowed.get(str(p)) != old['category'] or not p.exists():
                 result['skipped'] += 1
                 continue
-            live = probe()
             now = inventory(p,live,c,old['category'])
             if not now['eligible'] or now['fingerprint'] != old['fingerprint']:
                 result['skipped'] += 1
                 continue
+            if old['category']=='worktrees':
+                # Always permanent: git refuses unclean trees itself, a second guard after inventory().
+                r = git('worktree','remove',str(p),cwd=now['main'])
+                if r.returncode: raise ValueError(r.stderr.strip() or 'git worktree remove failed')
+                git('worktree','prune',cwd=now['main'])
+                result['deleted'] += 1
+                result['bytes'] += now['bytes']
+                continue
+            logdir = stat.S_IMODE(p.lstat().st_mode) if old['category']=='logs' and p.is_dir() else None
             if permanent:
                 if p.is_dir(): shutil.rmtree(p)
                 else: p.unlink()
+                if logdir is not None: p.mkdir(mode=logdir)
                 if old['category']=='trash' and p.parent.name=='files':
                     info=p.parent.parent/'info'/(p.name+'.trashinfo')
                     if info.is_file() and not info.is_symlink(): info.unlink()
-                result['deleted']=result.get('deleted',0)+1
+                result['deleted'] += 1
                 result['bytes']+=now['bytes']
                 continue
             vault = p.parent/'.smart-storage-recovery'
@@ -281,6 +418,7 @@ def stage(report, permanent=False, rules=None):
             records.append(record)
             write(STATE/'recovery.json',records)  # Journal before the atomic move.
             p.rename(dest)
+            if logdir is not None: p.mkdir(mode=logdir)
             record['state'] = 'staged'
             record['fingerprint'] = inventory(dest,live,c,old['category'])['fingerprint']
             write(STATE/'recovery.json',records)
@@ -346,16 +484,67 @@ def recover_or_purge(action, aged=False):
     write(STATE/'last-action.json',result)
     return result
 
+def png(size, rows):
+    def chunk(t, d): return struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff)
+    return (b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',size,size,8,6,0,0,0))
+            +chunk(b'IDAT',zlib.compress(b''.join(b'\x00'+r for r in rows),6))+chunk(b'IEND',b''))
+
+def pie_png(groups):
+    """Donut of bytes per category as a cached PNG for ui.image (no chart primitive in the plugin UI)."""
+    slices = [(g['bytes'],g['color']) for g in groups if g['bytes']>0]
+    if not slices: return ''
+    out = STATE/('pie-'+hashlib.sha256(json.dumps(slices).encode()).hexdigest()[:12]+'.png')
+    if out.exists(): return str(out)
+    N, SS = 200, 2
+    size = N*SS; cx = size/2; R = cx-SS; r0 = R*0.6
+    total = sum(b for b,_ in slices); acc = 0.0; bounds = []
+    for b,col in slices:
+        acc += b/total; bounds.append((acc, bytes.fromhex(col.lstrip('#'))))
+    rows = []
+    for y in range(N):
+        row = bytearray()
+        for x in range(N):
+            r=g=b=h=0
+            for sy in range(SS):
+                for sx in range(SS):
+                    px, py = x*SS+sx+0.5-cx, y*SS+sy+0.5-cx
+                    d = math.hypot(px,py)
+                    if r0 <= d <= R:
+                        frac = (math.atan2(py,px)/(2*math.pi)+0.25) % 1.0
+                        col = next((col for bound,col in bounds if frac <= bound), bounds[-1][1])
+                        r+=col[0]; g+=col[1]; b+=col[2]; h+=1
+            row += bytes((r//h, g//h, b//h, 255*h//(SS*SS))) if h else b'\0\0\0\0'
+        rows.append(bytes(row))
+    for old in STATE.glob('pie-*.png'): old.unlink()
+    out.write_bytes(png(N, rows))
+    return str(out)
+
+def aged(items, c):
+    if not c['age_days']: return items
+    cut = time.time()-c['age_days']*DAY
+    return [x | {'reason':'Recently changed','eligible':False} if x['eligible'] and x.get('latest',0) > cut else x for x in items]
+
+def shade(hexcolor, k):
+    """Mix toward white (k>0) or black (k<0) so four theme colors cover every category."""
+    rgb = bytes.fromhex(hexcolor.lstrip('#'))
+    return '#'+''.join(f'{int(v+(255-v)*k) if k>0 else int(v*(1+k)):02x}' for v in rgb)
+
 def summary(report):
     c = config()
-    groups = []
-    for cat,label in LABELS.items():
-        rows = [x for x in report.get('items',[]) if x['category']==cat]
-        groups.append({'id':cat,'label':label,'bytes':sum(x['bytes'] for x in rows),
+    theme = read(HOME/'.config/noctalia/colors.json',{})
+    palette = [shade(theme.get(name,'#8899aa'),k) for k in (0,-0.35,0.4) for name in COLORS]
+    items = aged(report.get('items',[]), c)
+    groups, shown, per = [], [], {}
+    for i,(cat,label) in enumerate(LABELS.items()):
+        rows = [x for x in items if x['category']==cat]
+        groups.append({'id':cat,'label':label,'bytes':sum(x['bytes'] for x in rows),'color':palette[i],
                       'eligible':sum(x.get('reclaimable',x['bytes']) for x in rows if x['eligible']),
                       'count':len(rows),'enabled':cat in c['categories']})
-    return {'at':report.get('at',0),'config':c,'disks':disks(),'groups':groups,
-            'items':report.get('items',[])[:150],'item_count':len(report.get('items',[])),
+    for x in items:  # ponytail: 60 rows per category; paginate when someone actually has more
+        n = per.get(x['category'],0)
+        if n < 60: shown.append(x); per[x['category']] = n+1
+    return {'at':report.get('at',0),'config':c,'disks':disks(),'groups':groups,'pie':pie_png(groups),
+            'items':shown,'item_count':len(items),
             'eligible':sum(g['eligible'] for g in groups if g['enabled']),
             'recovery_bytes':sum(r['bytes'] for r in recovery()),'recovery_count':len(recovery()),
             'history':report.get('history',[]),'last_action':read(STATE/'last-action.json',{}),
@@ -373,6 +562,7 @@ def main():
     parser.add_argument('--age',type=int,choices=[0,1,7,30,90])
     parser.add_argument('--schedule',type=int,choices=[0,1,7,30])
     parser.add_argument('--categories')
+    parser.add_argument('--ids')
     args=parser.parse_args()
     if os.getuid()==0:
         raise ValueError('The cleaner must run as your normal user')
@@ -407,7 +597,7 @@ def main():
                 except ProcessLookupError:
                     pass
             command=[sys.executable,str(Path(__file__).resolve()),args.operation]
-            for name in ('age','schedule','categories','path','mode','kind'):
+            for name in ('age','schedule','categories','path','mode','kind','ids'):
                 value=getattr(args,name)
                 if value is not None: command += ['--'+name,str(value)]
             with (STATE/'job-output.json').open('w') as output:
@@ -428,7 +618,6 @@ def main():
                 if any(x not in LABELS for x in cats): raise ValueError('Unknown category')
                 c['categories']=cats
             write(CONFIG,c)
-            if args.age is not None: report=scan()
         elif args.action=='scan': report=scan()
         elif args.action=='system':
             if not args.kind: raise ValueError('Missing system action')
@@ -484,7 +673,7 @@ def main():
                   {'at':time.time(),'results':results})
         elif args.action in ('stage','delete'):
             if not report: raise ValueError('Scan before cleaning')
-            stage(report,permanent=args.action=='delete')
+            stage(report,permanent=args.action=='delete',ids=set(args.ids.split(',')) if args.ids else None)
             report=scan()
         elif args.action in ('restore','purge'):
             recover_or_purge(args.action)
