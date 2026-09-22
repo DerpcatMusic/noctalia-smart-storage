@@ -1,12 +1,13 @@
 id = "derpcat/smart-storage"
 name = "Smart Storage"
-version = "1.0.1"
+version = "2.1.0"
 plugin_api = 9
 author = "derpcat"
 license = "MIT"
 icon = "database"
-description = "Storage trends, developer caches, live-use protection and recoverable cleanup."
+description = "Storage cleaner: dev caches, builds, worktrees, logs, duplicates — live-use checks, pie chart, recoverable staging."
 dependencies = ["python3", "sudo", "findmnt"]
+tags = ["panel", "bar", "system", "utility", "development"]
 
 [[widget]]
 id = "storage"
@@ -15,7 +16,7 @@ entry = "widget.luau"
 [[panel]]
 id = "dashboard"
 entry = "panel.luau"
-width = 892
-height = 780
+width = 760
+height = 660
 placement = "floating"
 position = "center"

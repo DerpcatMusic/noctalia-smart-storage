@@ -26,13 +26,16 @@ def live():
     return result
 
 def main():
-    if len(sys.argv)!=2 or sys.argv[1] not in ('preview','packages','packages-all','snapshots','temp'):
-        raise ValueError('Expected preview, packages, snapshots or temp')
+    if len(sys.argv)!=2 or sys.argv[1] not in ('preview','packages','packages-all','snapshots','temp','journal'):
+        raise ValueError('Expected preview, packages, snapshots, temp or journal')
     action=sys.argv[1]
     ids,remove=snapshots()
     if action=='preview':
         size=int(command('/usr/bin/du','-sx','-B1','/var/cache/pacman/pkg').split()[0])
+        logs=int(command('/usr/bin/du','-sx','-B1','/var/log').split()[0])
+        journal=int(command('/usr/bin/du','-sx','-B1','/var/log/journal').split()[0]) if Path('/var/log/journal').is_dir() else 0
         print(json.dumps({'package_bytes':size,'package_preview':command('/usr/bin/paccache','-d','-k','1'),
+              'log_bytes':logs,'journal_bytes':journal,
               'snapshot_count':len(ids),'snapshot_remove':remove,'snapshot_keep':[i for i in ids if i not in remove],
               'note':'Btrfs snapshots share extents; their sizes cannot be summed as reclaimable space.'}))
         return
@@ -43,6 +46,8 @@ def main():
         if any(x.startswith('/var/cache/pacman/') for x in p['paths']):
             raise RuntimeError('Package cache is in use; stopped')
         result=command('/usr/bin/paccache','-r','-k','0' if action=='packages-all' else '1')
+    elif action=='journal':
+        result=command('/usr/bin/journalctl','--vacuum-size=200M','--vacuum-time=14d')
     elif action=='snapshots':
         paths=['/.snapshots/'+str(i)+'/' for i in remove]
         if any(any(x.startswith(base) for base in paths) for x in p['paths']):
