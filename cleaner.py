@@ -148,7 +148,7 @@ def describe(path, category, item):
         return tool+' package cache · re-downloaded on install · '+age
     if category=='apps':
         for needle, what in (('OptGuideOnDeviceModel','Chrome on-device AI model · re-downloaded if the feature is used'),
-                             ('buffr/capture','BUFFR capture spill buffers'), ('session-artifacts','Prime agent session artifacts'),
+                             ('buffr/capture','BUFFR capture spill buffers'), ('plugin-undo','Bitwig plugin-state undo history · only undo steps are lost'), ('session-artifacts','Prime agent session artifacts'),
                              ('winetricks','winetricks download cache · re-downloaded'), ('.var/app','flatpak app cache')):
             if needle in s: return f"{what} · {item['files']} files · {age}"
         return f"{parent} cache · regenerates · {age}"
@@ -259,6 +259,7 @@ def candidates():
       'apps':[HOME/'.config/google-chrome/OptGuideOnDeviceModel',HOME/'.cache/google-chrome',HOME/'.cache/google-chrome-headless',
               HOME/'.cache/google-chrome-for-testing-headless',HOME/'.cache/zen',HOME/'.cache/spotify',HOME/'.cache/winetricks',
               HOME/'.cache/thunderbird',HOME/'.cache/codex-desktop',HOME/'.prime/agent/session-artifacts',HOME/'.cache/buffr/capture',
+              HOME/'.BitwigStudio/plugin-undo',HOME/'.BitwigStudio/cache',
               *HOME.glob('.var/app/*/cache')]}
     seen = set()
     def children(p, cat):
