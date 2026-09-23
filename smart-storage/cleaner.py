@@ -527,14 +527,20 @@ def move_aside(p):
     journal(add)
     reap_later()  # space comes back while the rest is still being checked
 
+def remove_tree(p):
+    quiet = {'stdout':subprocess.DEVNULL,'stderr':subprocess.DEVNULL}
+    if subprocess.run(['/usr/bin/rm','-rf','--one-file-system','--',p],**quiet).returncode:
+        # Read-only folders (Go's module cache, some tool installs) block unlinking their entries: make ours writable, retry.
+        subprocess.run(['/usr/bin/chmod','-R','u+w','--',p],**quiet)
+        subprocess.run(['/usr/bin/rm','-rf','--one-file-system','--',p],**quiet)
+
 def reap():
     """Background: delete what move_aside() renamed. One reaper at a time; a later spawn waits, then re-checks."""
     with (STATE/'reaper.lock').open('w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         while paths := read(REAP,[]):
             with concurrent.futures.ThreadPoolExecutor(8) as threads:
-                threads.map(lambda p: subprocess.run(['/usr/bin/rm','-rf','--one-file-system','--',p],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL),
-                            [p for p in paths if os.path.basename(p).startswith('.smart-storage-deleting-')])  # only ever what move_aside() made
+                threads.map(remove_tree,[p for p in paths if os.path.basename(p).startswith('.smart-storage-deleting-')])  # only ever what move_aside() made
             left = journal(lambda j: [p for p in j if os.path.lexists(p)])
             if set(paths) <= set(left): return  # nothing removable this pass; the next spawn retries
 

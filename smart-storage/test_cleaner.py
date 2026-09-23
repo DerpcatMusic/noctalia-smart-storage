@@ -37,6 +37,7 @@ if __name__ == '__main__':  # pool workers re-import this file; only the parent 
         cleaner.reap_later = lambda: None  # a spawned reaper would use the real state dir
         (d/'tree').rename(d/'moved')
         assert cleaner.inventory(d/'moved', live, cleaner.DEFAULT, 'temp')['fingerprint'] == inline['fingerprint']
+        (d/'moved/0').chmod(0o555)  # read-only, like Go's module cache
         cleaner.move_aside(d/'moved')
         assert not (d/'moved').exists() and len(cleaner.read(cleaner.REAP, [])) == 1
         cleaner.reap()
