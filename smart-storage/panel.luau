@@ -34,8 +34,10 @@ local function alpha(c,a) return string.sub(c,1,1)=="#" and c..string.format("%0
 local WHY={{"^In use","in use"},{"^Protected while","tool running"},{"^Project is in use","project open"},{"special files","special files"},
   {"^Uncommitted","uncommitted"},{"^Not merged","unmerged"},{"^Checked out","checked out"},{"^Recently","changed recently"},
   {"^Unreadable","unreadable"},{"^Not entirely owned","not yours"},{"mount","has a mount"},{"keep marker","kept"},
-  {"^Locked","locked"},{"^Symlink","symlink"},{"^Process visibility","can't verify"}}
+  {"^Locked","locked"},{"^Symlink","symlink"}}
 local function why(r)
+  local who=string.match(r,"^Blocked: cannot see inside ([^;]+)")
+  if who then return "blocked by "..who end
   for _,w in ipairs(WHY) do if string.find(r,w[1]) then return w[2] end end
   return string.lower(r)
 end

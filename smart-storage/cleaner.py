@@ -13,7 +13,7 @@ LABELS = {'packages':'AUR package downloads', 'javascript':'Bun / npm caches',
           'python':'Python / pip / uv caches', 'rust':'Rust / compiler caches',
           'builds':'Rust build outputs', 'desktop':'Thumbnails / shaders', 'logs':'Application logs',
           'worktrees':'Git worktrees', 'branches':'Stale git branches', 'temp':'Temporary files', 'trash':'Trash / recycle bins',
-          'apps':'App caches', 'redundant':'Duplicates, old versions, backups'}
+          'apps':'App caches', 'redundant':'DAW project backups'}
 TOOLS = {
  'packages': {'pacman','paru','yay','shelly','makepkg','bsdtar'},
  'javascript': {'bun','npm','pnpm','yarn'},
@@ -28,14 +28,10 @@ EXCLUDE = {'.git','node_modules','.venv','venv','vendor','.smart-storage-recover
 LOG_BASES = [HOME/'.cache', HOME/'.config', HOME/'.local/share', HOME/'.local/state']
 LOG_NAME = re.compile(r'\.log(\.|$)')
 COLORS = ['mPrimary','mSecondary','mTertiary','mError']
-BACKUP = re.compile(r'backup|[-_.]bak(?![a-z])|\.old$|\.orig$|~$|[-_.]old$|\.bkp', re.I)
-VERSION = re.compile(r'^(.*?)[-_.]?v?(\d+(?:\.\d+)+)(.*)$')
-ARCHIVES = ('.tar.xz','.tar.gz','.tar.zst','.tar.bz2','.tgz','.zip','.7z','.dmg','.tar')
 SKIP = {'.git','node_modules','.cache','.rustup','.cargo','flatpak','containers','Steam','steamapps','.var','.smart-storage-recovery',
         '.venv','venv','vendor','__pycache__','.snapshots','externals','_update','registry','toolchains','rustup','cargo','.expo',
         'Trash','$RECYCLE.BIN','$Recycle.Bin','System Volume Information','lost+found'}  # trash has its own category
 INSTALLED = re.compile(r'/drive_c/(windows|ProgramData|Program Files( \(x86\))?|users/[^/]+/AppData)$')  # installed software, not user copies
-BIG = 64<<20
 BUDGET, SPLIT = 4000, 4  # entries per pool task; pieces an unfinished walk is split into
 MASK = (1<<128)-1
 UID = os.getuid()
@@ -94,6 +90,11 @@ def probe():
     result = subprocess.run(['/usr/bin/sudo','-n',HELPER+'probe'],
                             capture_output=True, text=True, timeout=45, check=True)
     p = json.loads(result.stdout)
+    def who(e):  # '1234: PermissionError' -> 'podman (1234)', so the panel can say what blocks cleanup
+        pid = e.split(':')[0]
+        try: return open(f'/proc/{pid}/comm').read().strip()+f' ({pid})'
+        except OSError: return e
+    p['errors'] = [who(e) for e in p['errors']]
     p['refs'] = {tuple(r) for r in p['refs']}
     p['mounts'] = {m['target'] for m in mounts()}
     return p
@@ -184,14 +185,6 @@ def cargo_target(p):
         return any(e.is_dir() and os.path.isdir(os.path.join(e.path,'.fingerprint')) for e in os.scandir(p))
     except OSError: return False
 
-def sample(path, size):
-    # ponytail: 3 MB sampled hash, not a full read; detail says "(sampled)". Full hash if a false match ever shows up.
-    h = hashlib.sha256()
-    with open(path,'rb') as f:
-        for off in (0, size//2, max(0,size-(1<<20))):
-            f.seek(off); h.update(f.read(1<<20))
-    return h.hexdigest()
-
 def is_target(d):
     if cargo_target(d): return True
     if not os.path.basename(d).startswith('target'): return False
@@ -205,16 +198,23 @@ def is_worktree(d):
     except (OSError,UnicodeError): return False
     return gitdir.startswith('gitdir: ') and '/.git/worktrees/' in gitdir
 
+def app_backup(name, siblings):
+    """Only backup folders a DAW writes by itself, recognised by the project file next to them. Never files, never
+    name guesses: 'Verse 1 Backup R.wav' is a vocal take, and same-size stems are not duplicates."""
+    if name == 'auto-backups' and any(n.endswith('.bwproject') for n in siblings): return 'Bitwig auto-backups'
+    if name == 'Backup' and 'Ableton Project Info' in siblings: return 'Ableton project backups'
+    return ''
+
 def discover(stack):
-    """Pool task: walk up to BUDGET entries for repos, worktrees, cargo targets and redundant files; returns the unwalked rest."""
-    found, notes, big, n = [], {}, [], 0
+    """Pool task: walk up to BUDGET entries for repos, worktrees, cargo targets and DAW backup folders; returns the unwalked rest."""
+    found, notes, n = [], {}, 0
     while stack and n < BUDGET:
         d = stack.pop()
         try:
             with os.scandir(d) as it: entries = list(it)
         except OSError: continue
         n += len(entries)+1
-        names, links, groups = {e.name for e in entries}, set(), {}
+        names = {e.name for e in entries}
         if ('.rustc_info.json' in names or os.path.basename(d).startswith('target')) and is_target(d):
             found.append((d,'builds'))
             continue
@@ -222,55 +222,21 @@ def discover(stack):
             if os.path.isdir(os.path.join(d,'.git')) and not os.path.islink(os.path.join(d,'.git')): found.append((d,'repo'))  # scan() expands it into 'branches' items
             elif is_worktree(d): found.append((d,'worktrees'))  # keep walking: build outputs inside are separate items
         for e in entries:
-            if e.is_symlink():
-                try: links.add(os.path.basename(os.readlink(e.path)))
-                except OSError: pass
-        for e in entries:
             if e.is_symlink() or e.name.startswith('.smart-storage'): continue  # recovery vaults, trees being reaped
             p, isdir = e.path, e.is_dir(follow_symlinks=False)
+            if isdir and (why := app_backup(e.name, names)):
+                notes[p] = why
+                continue
             # Mount points are walked as their own root (or not at all); flagged folders are still walked for builds and repos.
             if isdir and e.name not in SKIP and not e.name.startswith(('externals','.Trash')) and p not in MOUNTS and not INSTALLED.search(p):
                 stack.append(p)
-            if BACKUP.search(e.name):
-                notes[p] = 'backup by name'
-                continue
-            m = VERSION.match(e.name)
-            if m and m.group(1):
-                groups.setdefault((m.group(1),m.group(3),isdir),[]).append((tuple(int(x) for x in m.group(2).split('.')),e.name))
-            if isdir: continue
-            for suf in ARCHIVES:
-                if e.name.endswith(suf) and e.name[:-len(suf)] in names:
-                    notes[p] = f'archive already extracted to {e.name[:-len(suf)]}/'
-            try: st = e.stat(follow_symlinks=False)
-            except OSError: continue
-            if stat.S_ISREG(st.st_mode) and st.st_size >= BIG: big.append((st.st_size,p,st.st_dev,st.st_ino,st.st_mtime))
-        for members in groups.values():
-            if len(members) < 2: continue
-            current = next((name for _,name in members if name in links), max(members)[1])
-            for _,name in members:
-                if name != current: notes.setdefault(os.path.join(d,name), f'older version · current is {current}')
-    return {'found':found,'notes':notes,'big':big}, stack
+    return {'found':found,'notes':notes}, stack
 
 def nested(p, notes):
     while (q := os.path.dirname(p)) != p:
         if q in notes: return True
         p = q
     return False
-
-def duplicates(notes, big, pool):
-    """Same-content large files: the oldest copy nothing else flags is kept, the others are suggested."""
-    bysize = {}
-    for size, p, dev, ino, mtime in big: bysize.setdefault(size,{})[dev,ino] = (mtime,p)
-    files = [(size,mtime,p) for size,g in bysize.items() if len(g) > 1 for mtime,p in g.values()]
-    def digest(f):
-        try: return sample(f[2], f[0])
-        except OSError: return None
-    same = {}
-    for (size,mtime,p), h in zip(files, pool.map(digest, files)):
-        if h: same.setdefault((size,h),[]).append((mtime,p))
-    for group in same.values():
-        free = sorted(x for x in group if x[1] not in notes and not nested(x[1], notes))
-        for _,p in free[1:]: notes[p] = f'same content as {free[0][1].replace(str(HOME),"~")} (sampled)'
 
 def describe(path, category, item):
     s, name, parent = str(path), path.name, path.parent.name.lstrip('.')
@@ -353,7 +319,7 @@ def inventory(path, live, c, category, pool=None):
     if path.resolve() != path:
         reason = 'Symlink ancestor; protected'
     if live['errors']:
-        reason = 'Process visibility incomplete; cleanup blocked'
+        reason = 'Blocked: cannot see inside '+', '.join(live['errors'][:2])+'; runs again when it exits'
     if any(under(p, str(path)) for p in live['paths']):
         reason = 'In use: open file, binary, working directory or argument'
     # Tool-wide guards cover lazily opened cache files, beyond open descriptors.
@@ -484,7 +450,7 @@ def walk_roots(c):
 def walked(p, category, roots):
     """Stage-time check for walk-found items: still inside a scan root and still the same kind of thing."""
     if not any(under(p,r) and p!=r for r in roots): return False
-    return is_target(p) if category=='builds' else is_worktree(p) if category=='worktrees' else category=='redundant'
+    return is_target(p) if category=='builds' else is_worktree(p) if category=='worktrees' else category=='redundant' and os.path.isdir(p) and bool(app_backup(os.path.basename(p), os.listdir(os.path.dirname(p))))
 
 def disks():
     """Each filesystem once (btrfs subvolumes share a device), plus /tmp when it lives in RAM. 'mounts' lists
@@ -577,14 +543,12 @@ def scan():
     # Processes do the walking (no GIL); threads wait on them and on git. Items start measuring while the walk still runs.
     with walkers(live) as procs, concurrent.futures.ThreadPoolExecutor(32) as threads:
         preview = threads.submit(subprocess.check_output,['/usr/bin/sudo','-n',HELPER+'system','preview'],text=True,timeout=30)
-        jobs, notes, big, repos = [threads.submit(one,p,cat) for p,cat in candidates()], {}, [], set()
+        jobs, notes, repos = [threads.submit(one,p,cat) for p,cat in candidates()], {}, set()
         for part in fan_out(procs, discover, walk_roots(c)):
             jobs += [threads.submit(one,p,cat) for p,cat in part['found']]
             repos |= {p for p,cat in part['found'] if cat in ('repo','worktrees')}
             notes |= part['notes']
-            big += part['big']
-        duplicates(notes, big, threads)
-        # Inside a work tree, version- and backup-named files are sources and fixtures: git's business, not ours.
+        # Inside a work tree, backups are git's business, not ours.
         jobs += [threads.submit(one,p,'redundant',why) for p,why in notes.items() if not nested(p,notes) and not nested(p,repos)]
         for job in jobs: items += job.result()
         try: write(STATE/'system.json',json.loads(preview.result()))

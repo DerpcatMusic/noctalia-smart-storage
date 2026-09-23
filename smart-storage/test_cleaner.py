@@ -7,9 +7,6 @@ assert [x['eligible'] for x in cleaner.aged(items,{'age_days':7})] == [False,Tru
 assert cleaner.shade('#ffffff',-0.5) == '#7f7f7f' and cleaner.shade('#000000',0.5) == '#7f7f7f'
 assert cleaner.LOG_NAME.search('launcher.log') and cleaner.LOG_NAME.search('x.log.1') and not cleaner.LOG_NAME.search('catalog.json')
 assert set(cleaner.DEFAULT['categories']).isdisjoint({'trash','worktrees','branches'})
-assert cleaner.BACKUP.search('buffr-drafts-backup-20260824') and cleaner.BACKUP.search('settings.toml.bak-x') and not cleaner.BACKUP.search('bakery')
-m = cleaner.VERSION.match('bin.2.336.0'); assert m.group(1)=='bin' and m.group(2)=='2.336.0'
-m = cleaner.VERSION.match('ElementalWarrior-wine-11.12-v4'); assert m.group(2)=='11.12' and m.group(3)=='-v4'
 
 if __name__ == '__main__':  # pool workers re-import this file; only the parent builds trees
     import concurrent.futures, multiprocessing, os, tempfile
@@ -44,28 +41,22 @@ if __name__ == '__main__':  # pool workers re-import this file; only the parent 
         assert cleaner.read(cleaner.REAP, []) == [] and not any(x.name.startswith('.smart-storage') for x in d.iterdir())
 
         w = d/'walk'
-        for p in ('proj/.git','proj/target/debug/.fingerprint','app-1.2','app-1.10','foo-1.0','foo_1.0','old-backup/inner/target/x/.fingerprint','pkg'):
+        for p in ('proj/.git','proj/target/debug/.fingerprint','old-backup/inner/target/x/.fingerprint',
+                  'Song/auto-backups','Song Project/Backup','Song Project/Ableton Project Info','Vox/Backup','Stems/auto-backups'):
             (w/p).mkdir(parents=True)
         for t in (w/'proj/target', w/'old-backup/inner/target'):
             (t/'.rustc_info.json').write_text('{}')
             (t/'CACHEDIR.TAG').write_text('Signature: 8a477f597d28d172789f06886806bc55')
-        (w/'pkg.zip').write_bytes(b'z')
+        (w/'Song/Song.bwproject').write_bytes(b'b')
+        for f in ('Vox/Verse 1 Backup R_1.wav', 'Vox/take.wav.bak', 'Stems/kick.wav', 'Stems/snare.wav'):
+            (w/f).write_bytes(b'\0'*4096)  # same size, same bytes: still never "duplicates"
         found, notes = [], {}
-        for part in cleaner.fan_out(None, cleaner.discover, [str(w)]):  # equal versions (foo-1.0, foo_1.0) must not crash
+        for part in cleaner.fan_out(None, cleaner.discover, [str(w)]):
             found += part['found']
             notes |= part['notes']
         s = str(w)
         assert {(s+'/proj','repo'), (s+'/proj/target','builds'), (s+'/old-backup/inner/target','builds')} <= set(found), found
-        assert notes[s+'/app-1.2'] == 'older version · current is app-1.10' and s+'/app-1.10' not in notes
-        assert notes[s+'/old-backup'] == 'backup by name' and notes[s+'/pkg.zip'].startswith('archive already extracted')
-
-        # Duplicates never flag the last unflagged copy, even when the oldest copy sits in a flagged folder.
-        for i, sub in enumerate(('bk-backup','b','c')):
-            (d/sub).mkdir()
-            (d/sub/'x.iso').write_bytes(b'same'*300)
-            os.utime(d/sub/'x.iso', (i+1, i+1))
-        notes = {str(d/'bk-backup'):'backup by name'}
-        big = [(1200, str(d/sub/'x.iso'), 0, i, i+1.0) for i, sub in enumerate(('bk-backup','b','c'))]
-        with concurrent.futures.ThreadPoolExecutor() as threads: cleaner.duplicates(notes, big, threads)
-        assert str(d/'c/x.iso') in notes and str(d/'b/x.iso') not in notes and cleaner.nested(str(d/'bk-backup/x.iso'), notes)
+        # Only folders a DAW wrote next to its project file: no name guesses, no files, no duplicates.
+        assert notes == {s+'/Song/auto-backups':'Bitwig auto-backups', s+'/Song Project/Backup':'Ableton project backups'}, notes
+        assert cleaner.walked(s+'/Song/auto-backups','redundant',[s]) and not cleaner.walked(s+'/Vox/Backup','redundant',[s])
     print('ok')
