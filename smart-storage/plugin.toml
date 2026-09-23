@@ -1,11 +1,11 @@
 id = "derpcat/smart-storage"
 name = "Smart Storage"
-version = "2.1.0"
+version = "2.2.0"
 plugin_api = 9
 author = "derpcat"
 license = "MIT"
 icon = "database"
-description = "Storage cleaner: dev caches, builds, worktrees, logs, duplicates — live-use checks, pie chart, recoverable staging."
+description = "Storage cleaner: dev caches, Rust builds, worktrees, logs, DAW backups — live-use checks, per-disk chart, recoverable staging."
 dependencies = ["python3", "sudo", "findmnt"]
 tags = ["panel", "bar", "system", "utility", "development"]
 
