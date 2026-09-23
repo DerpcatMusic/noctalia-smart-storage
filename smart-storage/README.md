@@ -24,7 +24,7 @@ noctalia msg panel-toggle derpcat/smart-storage:dashboard
 4. **System** runs package-cache, Snapper snapshot, `/tmp` and journal cleanup through `pkexec` (graphical admin prompt, nothing stored).
 5. **Settings**: minimum age, schedule (manual / daily / weekly / monthly), stage vs delete.
 
-Every row has a detail line saying what it is and why it is safe to remove (`Cargo target of foo · debug 1.2 G · rebuilt on next build`, `older version · current is grok-1.0.40`, `same content as ~/x.zip (sampled)`).
+Every row has a detail line saying what it is and why it is safe to remove (`Cargo target of foo · debug 1.2 G · rebuilt on next build`, `Steam shader cache · Hades · rebuilt while playing`, `Bitwig plugin-state undo history · only undo steps are lost`).
 
 ### Categories
 
