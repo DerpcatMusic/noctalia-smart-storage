@@ -1,5 +1,5 @@
 local data, render, refresh, run
-local busy, polling, lastStatus = false, false, ""
+local busy, polling, lastStatus, deleting, hidden = false, false, "", false, {}
 local view, filter, message, confirm = "items", nil, "", nil
 local HOME = noctalia.expandPath("~")
 local function quote(s) return "'"..string.gsub(s,"'","'\\''").."'" end
@@ -25,7 +25,7 @@ local function button(label,fn,variant,enabled,extra)
   if extra then for k,v in pairs(extra) do o[k]=v end end
   return ui.button(o)
 end
-local function mutate(label,fn,variant,enabled) return button(label,fn,variant,enabled~=false and not busy) end
+local function mutate(label,fn,variant,enabled) return button(label,fn,variant,enabled~=false and not busy and not deleting) end
 
 -- Status polling: only re-render when the backend output actually changed.
 refresh=function()
@@ -78,6 +78,22 @@ local function toggleCategory(g,on)
   end
   configure("--categories "..quote(table.concat(ids,",")),function(c) c.categories=ids end)
 end
+-- Deleting is a direct call (renames, well under a second plus the live-use probe): rows vanish at once,
+-- the backend's reply brings the real state, and anything it skipped comes back.
+local function remove(id)
+  if busy or deleting then return end
+  local on={}
+  for _,g in ipairs(data.groups) do on[g.id]=g.enabled end
+  for _,x in ipairs(data.items) do
+    if x.id==id or (not id and x.eligible and on[x.category]) then hidden[x.id]=true end
+  end
+  deleting=true;confirm=nil;message="Deleting…";render()
+  noctalia.runAsync(cleaner((data.config.mode=="delete" and "delete" or "stage")..(id and " --ids "..id or "")),function(r)
+    local d=noctalia.json.decode(r.stdout or "")
+    deleting=false;hidden={};lastStatus=""
+    if r.exitCode~=0 or not d or d.error then message=d and d.error or "Delete failed";render() else refresh() end
+  end)
+end
 local function eligibleTotal()
   local n=0
   for _,g in ipairs(data.groups) do if g.enabled then n=n+g.eligible end end
@@ -129,15 +145,15 @@ local function itemRow(x)
       text(name,x.eligible and "on_surface" or "on_surface_variant",12,{flexGrow=1,maxLines=1}),
       text(isBranch and "branch" or size(x.bytes),"primary",12),
       button(sure and "Sure?" or (isBranch and "git branch -d" or (data.config.mode=="delete" and "Delete" or "Stage")),
-        function() if sure then run(data.config.mode=="delete" and "delete" or "stage"," --ids "..x.id) else confirm=x.id;render() end end,
-        sure and "destructive" or "ghost",x.eligible and not busy)}),
+        function() if sure then remove(x.id) else confirm=x.id;render() end end,
+        sure and "destructive" or "ghost",x.eligible and not busy and not deleting)}),
     text((x.reason~="" and x.reason.."  ·  " or "")..(x.detail or ""),x.reason~="" and "error" or "on_surface_variant",11,{maxLines=1})})
 end
 
 local function items()
   local rows,n,shown={},0,0
   for _,x in ipairs(data.items) do
-    if not filter or x.category==filter then
+    if (not filter or x.category==filter) and not hidden[x.id] then
       n=n+1
       if shown<80 then table.insert(rows,itemRow(x));shown=shown+1 end
     end
@@ -175,7 +191,7 @@ local function settings()
     mutate("Restore",function() run("restore") end,"secondary",data.recovery_count>0),
     mutate(confirm=="purge" and "Sure?" or "Empty",function() if confirm=="purge" then run("purge") else confirm="purge";render() end end,"destructive",data.recovery_count>0)}))
   for _,e in ipairs(data.last_action and data.last_action.errors or {}) do table.insert(rows,text(short(e,120),"error",11)) end
-  table.insert(rows,text("Worktrees are removed with git worktree remove (never staged); branches with git branch -d (merged only). Create .keepstorage in a folder to protect its subtree.","on_surface_variant",11,{maxLines=3}))
+  table.insert(rows,text("Worktrees are removed and pruned from git (never staged; locked ones are kept); branches with git branch -d (merged only). Create .keepstorage in a folder to protect its subtree.","on_surface_variant",11,{maxLines=3}))
   return rows
 end
 
@@ -190,7 +206,7 @@ render=function()
     ui.row({gap=6,align="center"},{
       mutate(busy and "Working…" or "Rescan",function() run("scan") end,"secondary"),
       mutate(confirm=="all" and ("Sure? "..size(total)) or ((data.config.mode=="delete" and "Delete selected " or "Stage selected ")..size(total)),
-        function() if confirm=="all" then run(data.config.mode=="delete" and "delete" or "stage") else confirm="all";render() end end,"destructive",total>0),
+        function() if confirm=="all" then remove(nil) else confirm="all";render() end end,"destructive",total>0),
       text(message,"on_surface_variant",11,{flexGrow=1,maxLines=1}),
       button("Items"..filterLabel,function() view="items";render() end,view=="items" and "secondary" or "ghost"),
       button("System",function() view="system";confirm=nil;render() end,view=="system" and "secondary" or "ghost"),

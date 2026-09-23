@@ -32,6 +32,16 @@ if __name__ == '__main__':  # pool workers re-import this file; only the parent 
         assert all(inline[k]==pooled[k] for k in ('fingerprint','bytes','reclaimable','files')), (inline, pooled)
         assert inline['files'] == 6062 and inline['reclaimable'] < inline['bytes'] and inline['eligible']
 
+        # Staging reuses a folder's fingerprint after the move; deleting is a rename now and a reap later.
+        cleaner.STATE, cleaner.REAP = d/'state', d/'state/reap.json'
+        cleaner.STATE.mkdir()
+        (d/'tree').rename(d/'moved')
+        assert cleaner.inventory(d/'moved', live, cleaner.DEFAULT, 'temp')['fingerprint'] == inline['fingerprint']
+        cleaner.move_aside(d/'moved')
+        assert not (d/'moved').exists() and len(cleaner.read(cleaner.REAP, [])) == 1
+        cleaner.reap()
+        assert cleaner.read(cleaner.REAP, []) == [] and not any(x.name.startswith('.smart-storage') for x in d.iterdir())
+
         w = d/'walk'
         for p in ('proj/.git','proj/target/debug/.fingerprint','app-1.2','app-1.10','foo-1.0','foo_1.0','old-backup/inner/target/x/.fingerprint','pkg'):
             (w/p).mkdir(parents=True)

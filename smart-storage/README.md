@@ -20,7 +20,7 @@ noctalia msg panel-toggle derpcat/smart-storage:dashboard
 
 1. **Rescan** builds the inventory: your home and every mounted data drive, walked in parallel (a few seconds warm, ~25 s cold for ~3 M files).
 2. Toggle categories in the legend; the pie and the item list follow. Click a legend row to filter the list.
-3. **Delete selected** removes every eligible item in the enabled categories, or **Delete** a single row. With the *stage* mode in Settings, items move to `~/.smart-storage-recovery` for seven days instead.
+3. **Delete selected** removes every eligible item in the enabled categories, or **Delete** a single row. Rows vanish at once: after the live-use re-check (under a second) each item is renamed aside and deleted in the background. With the *stage* mode in Settings, items move to `.smart-storage-recovery` beside them for seven days instead.
 4. **System** runs package-cache, Snapper snapshot, `/tmp` and journal cleanup through `pkexec` (graphical admin prompt, nothing stored).
 5. **Settings**: minimum age, schedule (manual / daily / weekly / monthly), stage vs delete.
 
@@ -37,7 +37,7 @@ Every row has a detail line saying what it is and why it is safe to remove (`Car
 | Rust build outputs | every cargo `target/` and shared `CARGO_TARGET_DIR` on any scanned drive, CI build workspaces | on |
 | Thumbnails / shaders | thumbnails, mesa shader cache, Steam shader caches (all libraries, named by game) | on |
 | Application logs | `*.log` trees under `~/.cache`, `~/.config`, `~/.local`, runner `_diag` | on |
-| Git worktrees | worktrees whose branch is merged and tree is clean (`git worktree remove`) | off |
+| Git worktrees | worktrees whose branch is merged, tree is clean and not `git worktree lock`ed (removed, then `git worktree prune`) | off |
 | Stale git branches | merged local branches (`git branch -d`) | off |
 | Temporary files | your own top-level entries in `/tmp`, `/var/tmp`, `~/tmp` | on |
 | Trash | XDG trash on every scanned mount | off |
@@ -72,7 +72,7 @@ Sizes are logical estimates. Btrfs compression, reflinks and snapshots mean free
 
 ## IPC
 
-- `python3 <plugin dir>/cleaner.py scan | status | stage | delete | restore | purge | system --kind <packages|snapshots|temp|journal>` — everything the panel does, as JSON.
+- `python3 <plugin dir>/cleaner.py scan | status | stage | delete | restore | purge | system --kind <packages|snapshots|temp|journal>` — everything the panel does, as JSON. `reap` is the background remover: deleted items are first renamed to `.smart-storage-deleting-*` beside themselves and journaled in `reap.json`, so an interrupted removal resumes on the next run.
 - State and audit trail: `~/.local/state/smart-storage/` (`report.json` is the full inventory).
 - Schedule: `systemctl --user disable --now smart-storage.timer` turns automatic cleanup off.
 
@@ -80,4 +80,4 @@ Sizes are logical estimates. Btrfs compression, reflinks and snapshots mean free
 
 - Processes: `sudo -n` for the three helpers, `pkexec` for system actions, `git`, `du`, `findmnt`. No network access.
 - Scans use a process pool (one worker per CPU) that splits every walk, including a single huge item like a cargo registry, into pieces. Items are measured while the walk is still discovering more.
-- Filesystem writes: only under `~/.local/state/smart-storage`, `~/.smart-storage-recovery` and the items you delete.
+- Filesystem writes: only under `~/.local/state/smart-storage`, `.smart-storage-recovery` / `.smart-storage-deleting-*` beside the items you remove, and those items.

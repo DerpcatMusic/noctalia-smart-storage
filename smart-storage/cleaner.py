@@ -6,6 +6,7 @@ from pathlib import Path
 HOME = Path.home()
 STATE = HOME / '.local/state/smart-storage'
 CONFIG = STATE / 'config.json'
+REAP = STATE / 'reap.json'  # trees move_aside() renamed; reap() deletes them in the background
 HELPER = '/usr/local/libexec/smart-storage-'  # root helpers, see install.sh
 DAY = 86400
 LABELS = {'packages':'AUR package downloads', 'javascript':'Bun / npm caches',
@@ -131,9 +132,12 @@ def worktree_state(path):
     merged = bool(base) and git('merge-base','--is-ancestor','HEAD',base,cwd=path).returncode == 0
     head, ts = (git('log','-1','--format=%H %ct',cwd=path).stdout.split() or ['',0])[:2]
     idle = idle_days(int(ts))
+    try:
+        with open(path/'.git') as f: locked = os.path.exists(os.path.join(path, f.read().partition('gitdir:')[2].strip(), 'locked'))
+    except OSError: locked = True
     detail = f"{branch} · {'merged into '+base if merged else 'not merged'} · {idle}d since last commit · {'dirty '+str(dirty) if dirty else 'clean'} · of {Path(main).name}"
-    reason = 'Uncommitted changes' if dirty else '' if merged else 'Not merged into '+(base or 'a default branch')
-    return reason, detail, main, [head, dirty, base]
+    reason = 'Locked (git worktree lock)' if locked else 'Uncommitted changes' if dirty else '' if merged else 'Not merged into '+(base or 'a default branch')
+    return reason, detail, main, [head, dirty, base, locked]
 
 def branch_items(repo):
     """Merged branches are deletable (git branch -d); unmerged ones idle 30+ days are listed only."""
@@ -222,7 +226,7 @@ def discover(stack):
                 try: links.add(os.path.basename(os.readlink(e.path)))
                 except OSError: pass
         for e in entries:
-            if e.is_symlink(): continue
+            if e.is_symlink() or e.name.startswith('.smart-storage'): continue  # recovery vaults, trees being reaped
             p, isdir = e.path, e.is_dir(follow_symlinks=False)
             # Mount points are walked as their own root (or not at all); flagged folders are still walked for builds and repos.
             if isdir and e.name not in SKIP and not e.name.startswith(('externals','.Trash')) and p not in MOUNTS and not INSTALLED.search(p):
@@ -323,8 +327,11 @@ def note(part, p, name, s, root, dev):
         part['bytes'] += s.st_blocks*512
     part['latest'] = max(part['latest'], s.st_mtime, s.st_ctime)
     part['files'] += 1
-    # Order-free fingerprint (sum of entry hashes), so pieces of one walk can run in parallel.
-    h = hashlib.blake2b(os.fsencode(p[len(root)+1:] or '.')+struct.pack('<QQqqqI',s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns,mode),digest_size=16)
+    # Order-free fingerprint (sum of entry hashes), so pieces of one walk can run in parallel. A root folder's own
+    # times change when it is moved aside; its entries carry every change inside it.
+    rel = p[len(root)+1:]
+    times = (s.st_size,s.st_mtime_ns,s.st_ctime_ns) if rel or not isdir else (0,0,0)
+    h = hashlib.blake2b(os.fsencode(rel or '.')+struct.pack('<QQqqqI',s.st_dev,s.st_ino,*times,mode),digest_size=16)
     part['fp'] = (part['fp']+int.from_bytes(h.digest(),'little')) & MASK
     return isdir  # lstat: rmtree unlinks symlink entries and never follows their targets.
 
@@ -412,7 +419,7 @@ def candidates():
         p = p.resolve()
         if p.is_dir():
             for child in sorted(p.iterdir()):
-                if child.name != '.smart-storage-recovery' and not child.is_symlink():
+                if not child.name.startswith('.smart-storage') and not child.is_symlink():
                     yield child, cat
     for root in trash_roots():
         if root.name.startswith('S-1-'):
@@ -428,7 +435,7 @@ def candidates():
                 for n in ('src','pkg'):
                     if (clone/n).is_dir() and not (clone/n).is_symlink() and not clone.is_symlink(): yield clone/n, 'packages'
             for directory, dirs, files in os.walk(base, followlinks=False):
-                dirs[:] = [d for d in dirs if d not in EXCLUDE and d not in ('src','pkg')
+                dirs[:] = [d for d in dirs if d not in EXCLUDE and d not in ('src','pkg') and not d.startswith('.smart-storage')
                            and not Path(directory,d).is_symlink()]
                 for f in files:
                     if ('.pkg.tar.' in f or f.endswith(('.tar.gz','.tar.xz','.tar.zst','.zip','.deb','.rpm','.AppImage'))) and not f.endswith(('.sig','.part','.tmp')):
@@ -497,6 +504,51 @@ def disks():
 def recovery():
     return read(STATE/'recovery.json',[])
 
+def walkers(live):
+    """Process pool for walks (started on first use); forkserver workers get the probe snapshot through _init."""
+    return concurrent.futures.ProcessPoolExecutor(mp_context=multiprocessing.get_context('forkserver'),
+                                                  initializer=_init,initargs=(live['refs'],live['mounts']))
+
+def journal(change):
+    """Read-modify-write the reap journal under its own lock: move_aside() appends, reap() removes."""
+    with (STATE/'reap.lock').open('w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        paths = change(read(REAP,[]))
+        write(REAP,paths)
+        return paths
+
+def move_aside(p):
+    """Instant removal: rename beside itself for the reaper. Renamed under the journal lock, so the reaper never
+    sees an entry before its move, and a crash after the move still leaves it journaled."""
+    dest = str(p.parent/f'.smart-storage-deleting-{uuid.uuid4().hex}')
+    def add(paths):
+        p.rename(dest)
+        return paths+[dest]
+    journal(add)
+
+def reap():
+    """Background: delete what move_aside() renamed. One reaper at a time; a later spawn waits, then re-checks."""
+    with (STATE/'reaper.lock').open('w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        while paths := read(REAP,[]):
+            for p in paths:
+                if os.path.basename(p).startswith('.smart-storage-deleting-'):  # only ever what move_aside() made
+                    subprocess.run(['/usr/bin/rm','-rf','--one-file-system','--',p],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            left = journal(lambda j: [p for p in j if os.path.lexists(p)])
+            if set(paths) <= set(left): return  # nothing removable this pass; the next spawn retries
+
+def reap_later():
+    subprocess.Popen([sys.executable,str(Path(__file__).resolve()),'reap'],start_new_session=True,
+                     stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+
+def forget(report, result):
+    """Drop what was just removed, and anything inside it, from the report instead of rescanning."""
+    ids = set(result['removed'])
+    gone = {x['path'] for x in report['items'] if x['id'] in ids}
+    report['items'] = [x for x in report['items'] if x['path'] not in gone and not nested(x['path'],gone)]
+    write(STATE/'report.json',report)
+    return report
+
 def scan():
     c, live, items = config(), probe(), []
     PREVIOUS.update({x['path']:x for x in read(STATE/'report.json',{}).get('items',[]) if x['category']=='worktrees'})
@@ -512,9 +564,7 @@ def scan():
             return [] if category in ('repo','redundant') else [{'id':key(p),'path':str(p),'category':category,'bytes':0,'files':0,'latest':0,
                           'detail':'','reason':'Unreadable or changed: '+type(e).__name__,'eligible':False}]
     # Processes do the walking (no GIL); threads wait on them and on git. Items start measuring while the walk still runs.
-    with concurrent.futures.ProcessPoolExecutor(mp_context=multiprocessing.get_context('forkserver'),
-                                                initializer=_init,initargs=(live['refs'],live['mounts'])) as procs, \
-         concurrent.futures.ThreadPoolExecutor(32) as threads:
+    with walkers(live) as procs, concurrent.futures.ThreadPoolExecutor(32) as threads:
         preview = threads.submit(subprocess.check_output,['/usr/bin/sudo','-n',HELPER+'system','preview'],text=True,timeout=30)
         jobs, notes, big, repos = [threads.submit(one,p,cat) for p,cat in candidates()], {}, [], set()
         for part in fan_out(procs, discover, walk_roots(c)):
@@ -544,9 +594,9 @@ def scan():
 def stage(report, permanent=False, rules=None, ids=None):
     if time.time()-report['at'] > 1800:
         raise ValueError('Preview expired. Scan again before cleaning.')
-    c, records, result = (rules or config()), recovery(), {'staged':0,'deleted':0,'bytes':0,'skipped':0,'errors':[]}
+    c, records, result = (rules or config()), recovery(), {'staged':0,'deleted':0,'bytes':0,'skipped':0,'errors':[],'removed':[]}
     allowed, roots = {str(p):cat for p,cat in candidates()}, walk_roots(c)
-    live = probe()
+    live, todo = probe(), []
     for old in report['items']:
         if ids is not None:
             if old['id'] not in ids: continue
@@ -555,63 +605,65 @@ def stage(report, permanent=False, rules=None, ids=None):
         if c['age_days'] and time.time()-old.get('latest',0) < c['age_days']*DAY:
             result['skipped'] += 1
             continue
+        todo.append(old)
+    def verify(old):
+        if old['category']=='branches':
+            return next((b for b in branch_items(Path(old['repo'])) if b['branch']==old['branch']),None)
         p = Path(old['path'])
-        try:
-            if old['category']=='branches':
-                now = next((b for b in branch_items(Path(old['repo'])) if b['branch']==old['branch']),None)
+        if not p.exists() or (allowed.get(str(p)) != old['category'] and not walked(str(p),old['category'],roots)):
+            return None
+        # Small items are quicker inline than through the pool.
+        return inventory(p,live,c,old['category'],procs if old.get('files',0) > 4*BUDGET else None)
+    # Every item is re-checked in parallel against one probe snapshot; removals are renames, so instant.
+    with walkers(live) as procs, concurrent.futures.ThreadPoolExecutor(16) as threads:
+        for old, check in [(old, threads.submit(verify,old)) for old in todo]:
+            p = Path(old['path'])
+            try:
+                now = check.result()
                 if not now or not now['eligible'] or now['fingerprint'] != old['fingerprint']:
                     result['skipped'] += 1
                     continue
-                r = git('branch','-d',old['branch'],cwd=old['repo'])
-                if r.returncode: raise ValueError(r.stderr.strip() or 'git branch -d failed')
-                result['deleted'] += 1
-                continue
-            if not p.exists() or (allowed.get(str(p)) != old['category'] and not walked(str(p),old['category'],roots)):
-                result['skipped'] += 1
-                continue
-            now = inventory(p,live,c,old['category'])
-            if not now['eligible'] or now['fingerprint'] != old['fingerprint']:
-                result['skipped'] += 1
-                continue
-            if old['category']=='worktrees':
-                # Always permanent: git refuses unclean trees itself, a second guard after inventory().
-                r = git('worktree','remove',str(p),cwd=now['main'])
-                if r.returncode: raise ValueError(r.stderr.strip() or 'git worktree remove failed')
-                git('worktree','prune',cwd=now['main'])
-                result['deleted'] += 1
+                if old['category']=='branches':
+                    r = git('branch','-d',old['branch'],cwd=old['repo'])
+                    if r.returncode: raise ValueError(r.stderr.strip() or 'git branch -d failed')
+                    result['deleted'] += 1
+                elif old['category']=='worktrees':
+                    # Always permanent. worktree_state() required clean, merged and unlocked; prune drops git's record.
+                    move_aside(p)
+                    git('worktree','prune',cwd=now['main'])
+                    result['deleted'] += 1
+                elif permanent:
+                    logdir = stat.S_IMODE(p.lstat().st_mode) if old['category']=='logs' and p.is_dir() else None
+                    move_aside(p)
+                    if logdir is not None: p.mkdir(mode=logdir)
+                    if old['category']=='trash' and p.parent.name=='files':
+                        info=p.parent.parent/'info'/(p.name+'.trashinfo')
+                        if info.is_file() and not info.is_symlink(): info.unlink()
+                    result['deleted'] += 1
+                else:
+                    logdir = stat.S_IMODE(p.lstat().st_mode) if old['category']=='logs' and p.is_dir() else None
+                    vault = p.parent/'.smart-storage-recovery'
+                    if vault.is_symlink():
+                        raise ValueError('Recovery directory is a symlink')
+                    vault.mkdir(mode=0o700,exist_ok=True)
+                    if vault.stat().st_uid != os.getuid() or vault.stat().st_mode & 0o077:
+                        raise ValueError('Recovery directory must be private and user-owned')
+                    dest = vault/uuid.uuid4().hex
+                    record = {'id':dest.name,'path':str(p),'stored':str(dest),'at':time.time(),
+                              'bytes':now['bytes'],'category':old['category'],'state':'pending'}
+                    records.append(record)
+                    write(STATE/'recovery.json',records)  # Journal before the atomic move.
+                    p.rename(dest)
+                    if logdir is not None: p.mkdir(mode=logdir)
+                    record['state'] = 'staged'
+                    # A folder's fingerprint survives the move (root times are left out); a file's ctime does not.
+                    record['fingerprint'] = now['fingerprint'] if dest.is_dir() else inventory(dest,live,c,old['category'])['fingerprint']
+                    write(STATE/'recovery.json',records)
+                    result['staged'] += 1
                 result['bytes'] += now['bytes']
-                continue
-            logdir = stat.S_IMODE(p.lstat().st_mode) if old['category']=='logs' and p.is_dir() else None
-            if permanent:
-                if p.is_dir(): shutil.rmtree(p)
-                else: p.unlink()
-                if logdir is not None: p.mkdir(mode=logdir)
-                if old['category']=='trash' and p.parent.name=='files':
-                    info=p.parent.parent/'info'/(p.name+'.trashinfo')
-                    if info.is_file() and not info.is_symlink(): info.unlink()
-                result['deleted'] += 1
-                result['bytes']+=now['bytes']
-                continue
-            vault = p.parent/'.smart-storage-recovery'
-            if vault.is_symlink():
-                raise ValueError('Recovery directory is a symlink')
-            vault.mkdir(mode=0o700,exist_ok=True)
-            if vault.stat().st_uid != os.getuid() or vault.stat().st_mode & 0o077:
-                raise ValueError('Recovery directory must be private and user-owned')
-            dest = vault/uuid.uuid4().hex
-            record = {'id':dest.name,'path':str(p),'stored':str(dest),'at':time.time(),
-                      'bytes':now['bytes'],'category':old['category'],'state':'pending'}
-            records.append(record)
-            write(STATE/'recovery.json',records)  # Journal before the atomic move.
-            p.rename(dest)
-            if logdir is not None: p.mkdir(mode=logdir)
-            record['state'] = 'staged'
-            record['fingerprint'] = inventory(dest,live,c,old['category'])['fingerprint']
-            write(STATE/'recovery.json',records)
-            result['staged'] += 1
-            result['bytes'] += now['bytes']
-        except (OSError,ValueError,subprocess.SubprocessError) as e:
-            result['errors'].append(str(e))
+                result['removed'].append(old['id'])
+            except (OSError,ValueError,subprocess.SubprocessError) as e:
+                result['errors'].append(str(e))
     result['at'] = time.time()
     write(STATE/'last-action.json',result)
     return result
@@ -629,6 +681,7 @@ def valid_record(r):
 def recover_or_purge(action, aged=False):
     records, remaining, result = recovery(), [], {'restored':0,'purged':0,'bytes':0,'errors':[]}
     c = config()
+    live = probe() if action == 'purge' and records else None
     for r in records:
         try:
             p, stored = valid_record(r)
@@ -648,17 +701,14 @@ def recover_or_purge(action, aged=False):
                     continue
                 if kept(p,c):
                     raise ValueError('Pinned original; kept recovery copy: '+str(p))
-                check = inventory(stored,probe(),c | {'age_days':1},r['category'])
+                check = inventory(stored,live,c | {'age_days':1},r['category'])
                 if check['fingerprint'] != r.get('fingerprint'):
                     raise ValueError('Recovery content changed; restore or inspect it: '+str(p))
                 if check['reason'] and check['reason'] != 'Recently changed':
                     raise ValueError(check['reason']+': '+str(p))
                 # ponytail: snapshots cannot prevent a process starting just after the probe.
                 # Keep staging + grace; use .keepstorage for workloads that open files later.
-                if stored.is_dir():
-                    shutil.rmtree(stored)
-                else:
-                    stored.unlink()
+                move_aside(stored)
                 result['purged'] += 1
                 result['bytes'] += r['bytes']
             write(STATE/'recovery.json',remaining + records[records.index(r)+1:])
@@ -740,7 +790,7 @@ def summary(report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=['scan','status','stage','purge','restore','configure','auto','start','delete','explore','all-mounts','clean-temp','system'])
+    parser.add_argument('action',choices=['scan','status','stage','purge','restore','configure','auto','start','delete','explore','all-mounts','clean-temp','system','reap'])
     parser.add_argument('--operation',choices=['scan','stage','purge','restore','configure','delete','explore','all-mounts','system'])
     parser.add_argument('--path',default='/')
     parser.add_argument('--kind',choices=['packages','packages-all','snapshots','temp','journal'])
@@ -791,6 +841,9 @@ def main():
             write(STATE/'job.json',{'pid':child.pid,'operation':args.operation,'at':time.time()})
             print(json.dumps({'started':True}))
         return
+    if args.action == 'reap':  # never under the job lock: scans and deletes go on while it works
+        reap()
+        return
     with (STATE/'lock').open('w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         report = read(STATE/'report.json',{})
@@ -836,11 +889,10 @@ def main():
                   {'at':time.time(),'results':results})
         elif args.action in ('stage','delete'):
             if not report: raise ValueError('Scan before cleaning')
-            stage(report,permanent=args.action=='delete',ids=set(args.ids.split(',')) if args.ids else None)
-            report=scan()
+            report=forget(report,stage(report,permanent=args.action=='delete',ids=set(args.ids.split(',')) if args.ids else None))
         elif args.action in ('restore','purge'):
             recover_or_purge(args.action)
-            report=scan()
+            if args.action=='restore': report=scan()
         elif args.action=='auto':
             c=config()
             last=read(STATE/'last-auto.json',{'at':0})
@@ -850,8 +902,10 @@ def main():
                 recover_or_purge('purge',aged=True)
                 # Duplicates / old versions / backups are user files on every drive: suggested in the panel, never removed unattended.
                 stage(report,permanent=c['mode']=='delete',rules=c|{'categories':[x for x in c['categories'] if x!='redundant']})
+                reap()  # unattended: finish here, systemd ends the unit's processes when it exits
                 write(STATE/'last-auto.json',{'at':time.time()})
                 report=scan()
+        if read(REAP,[]): reap_later()  # also resumes a removal interrupted by a crash or reboot
         print(json.dumps(summary(report),separators=(',',':')))
 
 if __name__=='__main__':
