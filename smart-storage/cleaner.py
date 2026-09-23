@@ -495,10 +495,10 @@ def move_aside(p):
 
 def remove_tree(p):
     quiet = {'stdout':subprocess.DEVNULL,'stderr':subprocess.DEVNULL}
-    if subprocess.run(['/usr/bin/rm','-rf','--one-file-system','--',p],**quiet).returncode:
+    if subprocess.run(['/usr/bin/rm','-rf','--one-file-system','--',p],**quiet,check=False).returncode:
         # Read-only folders (Go's module cache, some tool installs) block unlinking their entries: make ours writable, retry.
-        subprocess.run(['/usr/bin/chmod','-R','u+w','--',p],**quiet)
-        subprocess.run(['/usr/bin/rm','-rf','--one-file-system','--',p],**quiet)
+        subprocess.run(['/usr/bin/chmod','-R','u+w','--',p],**quiet,check=False)
+        subprocess.run(['/usr/bin/rm','-rf','--one-file-system','--',p],**quiet,check=False)
 
 def reap():
     """Background: delete what move_aside() renamed. One reaper at a time; a later spawn waits, then re-checks."""
