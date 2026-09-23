@@ -1,6 +1,6 @@
 id = "derpcat/smart-storage"
 name = "Smart Storage"
-version = "2.1.0"
+version = "2.2.0"
 plugin_api = 9
 author = "derpcat"
 license = "MIT"

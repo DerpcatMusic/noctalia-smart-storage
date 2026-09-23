@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """Smart Storage: explicit disposable roots, live-use checks and reversible staging."""
-import argparse, concurrent.futures, fcntl, hashlib, json, math, os, re, shutil, stat, struct, subprocess, sys, time, uuid, zlib
+import argparse, concurrent.futures, fcntl, hashlib, json, math, multiprocessing, os, re, shutil, stat, struct, subprocess, sys, time, uuid, zlib
 from pathlib import Path
 
 HOME = Path.home()
@@ -21,8 +21,8 @@ TOOLS = {
  'builds': {'cargo','rustc','clang','gcc','cc','cmake','ninja','make'},
  'desktop': {'steam','gamescope'}, 'logs': set(), 'worktrees': set(), 'branches': set(), 'temp': set(), 'trash':set(), 'apps':set(), 'redundant':set()}
 DEFAULT = {'age_days':0, 'schedule_days':0, 'categories':[x for x in LABELS if x not in ('trash','worktrees','branches','apps','redundant')], 'pins':[], 'mode':'stage',
-           'roots':[]}  # roots: extra project directories to walk for build outputs, worktrees and branches (config.json only)
-DEV_ROOTS = [HOME/d for d in ('projects','Projects','src','dev','code','repos','work','actions-runners','.t3/worktrees','.codex/worktrees')]
+           'roots':[]}  # roots: extra directories to walk besides home and mounted drives (config.json only)
+SYSTEM = ('/boot','/efi','/usr','/var','/tmp','/root','/srv','/opt','/etc','/dev','/proc','/sys','/run','/home','/nix','/snap')
 EXCLUDE = {'.git','node_modules','.venv','venv','vendor','.smart-storage-recovery'}
 LOG_BASES = [HOME/'.cache', HOME/'.config', HOME/'.local/share', HOME/'.local/state']
 LOG_NAME = re.compile(r'\.log(\.|$)')
@@ -30,11 +30,35 @@ COLORS = ['mPrimary','mSecondary','mTertiary','mError']
 BACKUP = re.compile(r'backup|[-_.]bak(?![a-z])|\.old$|\.orig$|~$|[-_.]old$|\.bkp', re.I)
 VERSION = re.compile(r'^(.*?)[-_.]?v?(\d+(?:\.\d+)+)(.*)$')
 ARCHIVES = ('.tar.xz','.tar.gz','.tar.zst','.tar.bz2','.tgz','.zip','.7z','.dmg','.tar')
-SKIP = {'.git','node_modules','.cache','.rustup','.cargo','flatpak','containers','Steam','.var','.smart-storage-recovery',
-        '.venv','venv','target','__pycache__','.snapshots','externals','_update','registry','toolchains','rustup','cargo','.expo'}
+SKIP = {'.git','node_modules','.cache','.rustup','.cargo','flatpak','containers','Steam','steamapps','.var','.smart-storage-recovery',
+        '.venv','venv','vendor','__pycache__','.snapshots','externals','_update','registry','toolchains','rustup','cargo','.expo',
+        'Trash','$RECYCLE.BIN','$Recycle.Bin','System Volume Information','lost+found'}  # trash has its own category
 INSTALLED = re.compile(r'/drive_c/(windows|ProgramData|Program Files( \(x86\))?|users/[^/]+/AppData)$')  # installed software, not user copies
 BIG = 64<<20
+BUDGET, SPLIT = 4000, 4  # entries per pool task; pieces an unfinished walk is split into
+MASK = (1<<128)-1
+UID = os.getuid()
 PREVIOUS = {}  # last report's worktree rows; ineligible worktrees reuse their size while git state is unchanged
+REFS, MOUNTS = set(), set()  # per process: in-use inodes and mount points, set by _init
+
+def _init(refs, mounts):
+    global REFS, MOUNTS
+    REFS, MOUNTS = refs, mounts
+
+def fan_out(pool, task, stack, *args):
+    """Run a walk task inline, or spread each unwalked rest it returns across the pool."""
+    if pool is None:
+        while stack:
+            part, stack = task(stack, *args)
+            yield part
+        return
+    pending = {pool.submit(task, stack, *args)}
+    while pending:
+        done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+        for f in done:
+            part, rest = f.result()
+            yield part
+            pending |= {pool.submit(task, rest[i::SPLIT], *args) for i in range(min(SPLIT, len(rest)))}
 
 def read(path, default):
     try:
@@ -70,6 +94,7 @@ def probe():
                             capture_output=True, text=True, timeout=45, check=True)
     p = json.loads(result.stdout)
     p['refs'] = {tuple(r) for r in p['refs']}
+    p['mounts'] = {m['target'] for m in mounts()}
     return p
 
 def key(path):
@@ -146,6 +171,7 @@ def steam_name(appid):
 
 def cargo_target(p):
     # cargo writes .rustc_info.json at the target root and .fingerprint under each profile; CI targets lack CACHEDIR.TAG
+    p = Path(p)
     try:
         if not (p/'.rustc_info.json').is_file(): return False
         if (p/'CACHEDIR.TAG').read_text().startswith('Signature: 8a477f597d28d172789f06886806bc55'): return True
@@ -162,15 +188,35 @@ def sample(path, size):
             f.seek(off); h.update(f.read(1<<20))
     return h.hexdigest()
 
-def redundant(live, c):
-    """Backup-named entries, older versioned siblings, archives already extracted beside them, same-content large files."""
-    notes, bysize, stack = {}, {}, [str(HOME)]
-    while stack:  # ponytail: full home walk each scan (~4 s warm, 70 s cold); cache by dir mtime if it hurts
+def is_target(d):
+    if cargo_target(d): return True
+    if not os.path.basename(d).startswith('target'): return False
+    with os.scandir(d) as it: return any(e.is_dir(follow_symlinks=False) and cargo_target(e.path) for e in it)
+
+def is_worktree(d):
+    g = os.path.join(d,'.git')
+    try:
+        if os.path.islink(g): return False
+        with open(g) as f: gitdir = f.read(4096)
+    except (OSError,UnicodeError): return False
+    return gitdir.startswith('gitdir: ') and '/.git/worktrees/' in gitdir
+
+def discover(stack):
+    """Pool task: walk up to BUDGET entries for repos, worktrees, cargo targets and redundant files; returns the unwalked rest."""
+    found, notes, big, n = [], {}, [], 0
+    while stack and n < BUDGET:
         d = stack.pop()
         try:
             with os.scandir(d) as it: entries = list(it)
         except OSError: continue
+        n += len(entries)+1
         names, links, groups = {e.name for e in entries}, set(), {}
+        if ('.rustc_info.json' in names or os.path.basename(d).startswith('target')) and is_target(d):
+            found.append((d,'builds'))
+            continue
+        if '.git' in names:
+            if os.path.isdir(os.path.join(d,'.git')) and not os.path.islink(os.path.join(d,'.git')): found.append((d,'repo'))  # scan() expands it into 'branches' items
+            elif is_worktree(d): found.append((d,'worktrees'))  # keep walking: build outputs inside are separate items
         for e in entries:
             if e.is_symlink():
                 try: links.add(os.path.basename(os.readlink(e.path)))
@@ -178,47 +224,49 @@ def redundant(live, c):
         for e in entries:
             if e.is_symlink(): continue
             p, isdir = e.path, e.is_dir(follow_symlinks=False)
+            # Mount points are walked as their own root (or not at all); flagged folders are still walked for builds and repos.
+            if isdir and e.name not in SKIP and not e.name.startswith(('externals','.Trash')) and p not in MOUNTS and not INSTALLED.search(p):
+                stack.append(p)
             if BACKUP.search(e.name):
                 notes[p] = 'backup by name'
                 continue
             m = VERSION.match(e.name)
             if m and m.group(1):
-                groups.setdefault((m.group(1),m.group(3),isdir),[]).append((tuple(int(x) for x in m.group(2).split('.')),e))
-            if isdir:
-                if e.name not in SKIP and not e.name.startswith('externals') and not INSTALLED.search(p): stack.append(p)
-                continue
+                groups.setdefault((m.group(1),m.group(3),isdir),[]).append((tuple(int(x) for x in m.group(2).split('.')),e.name))
+            if isdir: continue
             for suf in ARCHIVES:
                 if e.name.endswith(suf) and e.name[:-len(suf)] in names:
                     notes[p] = f'archive already extracted to {e.name[:-len(suf)]}/'
             try: st = e.stat(follow_symlinks=False)
             except OSError: continue
-            if stat.S_ISREG(st.st_mode) and st.st_size >= BIG: bysize.setdefault(st.st_size,[]).append((p,st))
+            if stat.S_ISREG(st.st_mode) and st.st_size >= BIG: big.append((st.st_size,p,st.st_dev,st.st_ino,st.st_mtime))
         for members in groups.values():
             if len(members) < 2: continue
-            current = next((e for _,e in members if e.name in links), max(members)[1])
-            for _,e in members:
-                if e is not current and e.path not in notes:
-                    notes[e.path] = f'older version · current is {current.name}'
-                    if e.path in stack: stack.remove(e.path)
-    for size, files in bysize.items():
-        distinct = {(st.st_dev,st.st_ino):(p,st) for p,st in files}
-        if len(distinct) < 2: continue
-        byhash = {}
-        for p,st in distinct.values():
-            try: byhash.setdefault(sample(p,size),[]).append((p,st))
-            except OSError: pass
-        for same in byhash.values():
-            same.sort(key=lambda x:x[1].st_mtime)
-            for p,_ in same[1:]: notes[p] = f'same content as {same[0][0].replace(str(HOME),"~")} (sampled)'
-    items = []
-    for p, note in sorted(notes.items()):
-        if any(under(p, str(x)) for x in notes if x != p): continue
-        try:
-            it = inventory(Path(p), live, c, 'redundant')
-        except (OSError,ValueError): continue
-        it['detail'] = f"{note} · {idle_days(it['latest'])}d since last change"
-        items.append(it)
-    return items
+            current = next((name for _,name in members if name in links), max(members)[1])
+            for _,name in members:
+                if name != current: notes.setdefault(os.path.join(d,name), f'older version · current is {current}')
+    return {'found':found,'notes':notes,'big':big}, stack
+
+def nested(p, notes):
+    while (q := os.path.dirname(p)) != p:
+        if q in notes: return True
+        p = q
+    return False
+
+def duplicates(notes, big, pool):
+    """Same-content large files: the oldest copy nothing else flags is kept, the others are suggested."""
+    bysize = {}
+    for size, p, dev, ino, mtime in big: bysize.setdefault(size,{})[dev,ino] = (mtime,p)
+    files = [(size,mtime,p) for size,g in bysize.items() if len(g) > 1 for mtime,p in g.values()]
+    def digest(f):
+        try: return sample(f[2], f[0])
+        except OSError: return None
+    same = {}
+    for (size,mtime,p), h in zip(files, pool.map(digest, files)):
+        if h: same.setdefault((size,h),[]).append((mtime,p))
+    for group in same.values():
+        free = sorted(x for x in group if x[1] not in notes and not nested(x[1], notes))
+        for _,p in free[1:]: notes[p] = f'same content as {free[0][1].replace(str(HOME),"~")} (sampled)'
 
 def describe(path, category, item):
     s, name, parent = str(path), path.name, path.parent.name.lstrip('.')
@@ -254,13 +302,46 @@ def describe(path, category, item):
     if category=='trash': return ('trashed folder' if path.is_dir() else 'trashed file')+' · '+age
     return ''
 
-def inventory(path, live, c, category):
-    """Any uncertainty protects the entire unit; never follows symlinks/mounts."""
+def note(part, p, name, s, root, dev):
+    """Fold one entry into a partial inventory; True for a directory to descend."""
+    mode = s.st_mode
+    isdir = stat.S_ISDIR(mode)
+    if s.st_dev != dev or (isdir and p in MOUNTS):
+        part['reason'] = 'Contains a mount; protected'
+        return False
+    if s.st_uid != UID:
+        part['reason'] = 'Not entirely owned by this user'
+    if (s.st_dev,s.st_ino) in REFS:
+        part['reason'] = 'In use: open file, mapped binary or working directory'
+    if name in ('.keepbuild','.keepstorage'):
+        part['reason'] = 'Contains a keep marker'
+    if not isdir and not stat.S_ISLNK(mode) and not stat.S_ISREG(mode):
+        part['reason'] = 'Contains sockets or special files'
+    if stat.S_ISREG(mode) and s.st_nlink > 1:  # hard links count once; reclaimable only when every link is inside
+        part['links'].setdefault((s.st_dev,s.st_ino),[s.st_blocks*512,0,s.st_nlink])[1] += 1
+    else:
+        part['bytes'] += s.st_blocks*512
+    part['latest'] = max(part['latest'], s.st_mtime, s.st_ctime)
+    part['files'] += 1
+    # Order-free fingerprint (sum of entry hashes), so pieces of one walk can run in parallel.
+    h = hashlib.blake2b(os.fsencode(p[len(root)+1:] or '.')+struct.pack('<QQqqqI',s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns,mode),digest_size=16)
+    part['fp'] = (part['fp']+int.from_bytes(h.digest(),'little')) & MASK
+    return isdir  # lstat: rmtree unlinks symlink entries and never follows their targets.
+
+def measure(stack, root, dev):
+    """Pool task: fold up to BUDGET entries of one item; returns the partial and the unwalked rest."""
+    part, n = {'reason':'','bytes':0,'links':{},'latest':0,'files':0,'fp':0}, 0
+    while stack and n < BUDGET:
+        with os.scandir(stack.pop()) as it:
+            for e in it:
+                n += 1
+                if note(part, e.path, e.name, e.stat(follow_symlinks=False), root, dev):
+                    stack.append(e.path)
+    return part, stack
+
+def inventory(path, live, c, category, pool=None):
+    """Any uncertainty protects the entire unit; never follows symlinks/mounts. A pool walks big trees in parallel."""
     rootstat = path.lstat()
-    total, latest, count = 0, 0, 0
-    inodes = {}
-    digest = hashlib.sha256()
-    uid = os.getuid()
     reason = 'Pinned / keep marker' if kept(path, c) else ''
     if path.resolve() != path:
         reason = 'Symlink ancestor; protected'
@@ -280,39 +361,23 @@ def inventory(path, live, c, category):
         old = PREVIOUS.get(str(path))
         if reason and old and old.get('state') == extra['state']:
             return old | extra | {'reason':reason,'eligible':False}
-    root = str(path)
-    def note(p, s):
-        nonlocal reason, latest, count
-        if s.st_dev != rootstat.st_dev or (stat.S_ISDIR(s.st_mode) and os.path.ismount(p)):
-            reason = 'Contains a mount; protected'
-            return False
-        if s.st_uid != uid:
-            reason = 'Not entirely owned by this user'
-        if (s.st_dev,s.st_ino) in live['refs']:
-            reason = 'In use: open file, mapped binary or working directory'
-        name = os.path.basename(p)
-        if name in ('.keepbuild','.keepstorage'):
-            reason = 'Contains a keep marker'
-        link, isdir = stat.S_ISLNK(s.st_mode), stat.S_ISDIR(s.st_mode)
-        if not link and not isdir and not stat.S_ISREG(s.st_mode):
-            reason = 'Contains sockets or special files'
-        entry=inodes.setdefault((s.st_dev,s.st_ino),[s.st_blocks*512,0,s.st_nlink if stat.S_ISREG(s.st_mode) else 1])
-        entry[1]+=1
-        latest = max(latest, s.st_mtime, s.st_ctime)
-        count += 1
-        digest.update(os.fsencode(p[len(root)+1:] or '.'))
-        digest.update(str((s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns,s.st_mode)).encode())
-        return isdir and not link  # rmtree unlinks symlink entries and never follows their targets.
-    stack = [root] if note(root, rootstat) else []
-    while stack:
-        with os.scandir(stack.pop()) as it:
-            for e in sorted(it, key=lambda e: e.name):
-                if note(e.path, e.stat(follow_symlinks=False)):
-                    stack.append(e.path)
-    total=sum(v[0] for v in inodes.values())
-    reclaimable=sum(v[0] for v in inodes.values() if v[1]>=v[2])
-    item = {'id':key(path),'path':str(path),'category':category,'bytes':total,'reclaimable':reclaimable,'files':count,
-            'latest':latest,'fingerprint':digest.hexdigest(),'reason':reason,'eligible':not reason} | extra
+    _init(live['refs'], live['mounts'])
+    root, dev = str(path), rootstat.st_dev
+    acc = {'reason':'','bytes':0,'links':{},'latest':0,'files':0,'fp':0}
+    for part in (fan_out(pool, measure, [root], root, dev) if note(acc, root, path.name, rootstat, root, dev) else ()):
+        acc['reason'] = part['reason'] or acc['reason']
+        acc['bytes'] += part['bytes']
+        acc['files'] += part['files']
+        acc['latest'] = max(acc['latest'], part['latest'])
+        acc['fp'] = (acc['fp']+part['fp']) & MASK
+        for k, v in part['links'].items():
+            if k in acc['links']: acc['links'][k][1] += v[1]
+            else: acc['links'][k] = v
+    reason = acc['reason'] or reason
+    links = acc['links'].values()
+    item = {'id':key(path),'path':root,'category':category,'bytes':acc['bytes']+sum(v[0] for v in links),
+            'reclaimable':acc['bytes']+sum(v[0] for v in links if v[1]>=v[2]),'files':acc['files'],
+            'latest':acc['latest'],'fingerprint':f"{acc['fp']:032x}",'reason':reason,'eligible':not reason} | extra
     item.setdefault('detail', describe(path, category, item))
     return item
 
@@ -343,7 +408,6 @@ def candidates():
               HOME/'.cache/thunderbird',HOME/'.cache/codex-desktop',HOME/'.prime/agent/session-artifacts',HOME/'.cache/buffr/capture',
               HOME/'.BitwigStudio/plugin-undo',HOME/'.BitwigStudio/cache',
               *HOME.glob('.var/app/*/cache')]}
-    seen = set()
     def children(p, cat):
         p = p.resolve()
         if p.is_dir():
@@ -379,45 +443,41 @@ def candidates():
                 if LOG_NAME.search(f.name) and f.is_file() and not f.is_symlink(): yield f, 'logs'
     for d in (HOME/'.npm/_logs', HOME/'.t3/userdata/logs', *HOME.glob('actions-runners/*/_diag')):
         if d.is_dir() and not d.is_symlink(): yield d, 'logs'
-    for p in HOME.glob('.codex/*target*'):
-        if p.is_dir() and not p.is_symlink() and cargo_target(p): yield p, 'builds'
-    for base in DEV_ROOTS + [Path(x) for x in config()['roots']]:
-        if not base.is_dir():
-            continue
-        for directory, dirs, files in os.walk(base, followlinks=False):
-            p = Path(directory)
-            if '.git' in dirs:
-                yield p, 'repo'  # pseudo-category: scan() expands it into 'branches' items
-            elif '.git' in files and not (p/'.git').is_symlink():
-                try: gitdir = (p/'.git').read_text()
-                except (OSError,UnicodeError): gitdir = ''
-                if gitdir.startswith('gitdir: ') and '/.git/worktrees/' in gitdir:
-                    yield p, 'worktrees'  # keep walking: build outputs inside are separate items
-            dirs[:] = [d for d in dirs if d not in EXCLUDE and not (p/d).is_symlink()]
-            if str(p) not in seen and (cargo_target(p) or (p.name.startswith('target') and any(cargo_target(p/d) for d in dirs))):
-                seen.add(str(p))
-                yield p, 'builds'
-                dirs[:] = []
-            # Bound traversal to the explicitly identified development trees.
     for base in (Path('/tmp'),Path('/var/tmp'),HOME/'tmp'):
         if base.is_dir():
             for p in base.iterdir():
                 if (not p.name.startswith('.') and p.name != '.smart-storage-recovery'
                         and p.lstat().st_uid == os.getuid() and not p.is_symlink()):
                     yield p, 'temp'
-    yield HOME, 'redundant'  # pseudo-category: scan() expands it via redundant()
 
 def mounts():
     rows=json.loads(subprocess.check_output(['/usr/bin/findmnt','--json','--list',
                    '-o','TARGET,SOURCE,FSTYPE,FSROOT'],text=True))['filesystems']
     seen=set()
     for m in rows:
-        identity=(m['source'].split('[')[0],m['fsroot'])
-        m['scan']=m['fstype'] in ('btrfs','ext4','xfs','ntfs','ntfs3','fuseblk','vfat','exfat','tmpfs') and identity not in seen
-        # /run holds live services and credentials; report its capacity, don't traverse.
-        if under(m['target'],'/run'): m['scan']=False
+        source=m['source'].split('[')[0]
+        identity=(source,m['fsroot'])
+        # A bind of part of another mount (Steam compatdata into a library) is traversed there, never twice.
+        bind=any(n['source'].split('[')[0]==source and n['fsroot']!=m['fsroot'] and under(m['fsroot'],n['fsroot']) for n in rows)
+        m['scan']=m['fstype'] in ('btrfs','ext4','xfs','ntfs','ntfs3','fuseblk','vfat','exfat','tmpfs') and identity not in seen and not bind
+        # /run holds live services and credentials; report its capacity, don't traverse. /run/media is removable drives.
+        if under(m['target'],'/run') and not under(m['target'],'/run/media'): m['scan']=False
         seen.add(identity)
     return rows
+
+def walk_roots(c):
+    """Home, every mounted data drive and config roots; system trees are the System view's."""
+    home, rows = str(HOME), mounts()
+    targets = {m['target'] for m in rows}
+    roots = {home, *c['roots']} | {m['target'] for m in rows if m['scan'] and m['fstype']!='tmpfs' and m['target']!='/'
+             and (under(m['target'],home) or under(m['target'],'/run/media') or not any(under(m['target'],s) for s in SYSTEM))}
+    # Walks skip mount points, so mounted roots stay separate; other nested roots are already covered.
+    return sorted(r for r in roots if r in targets or not any(r!=x and under(r,x) for x in roots))
+
+def walked(p, category, roots):
+    """Stage-time check for walk-found items: still inside a scan root and still the same kind of thing."""
+    if not any(under(p,r) and p!=r for r in roots): return False
+    return is_target(p) if category=='builds' else is_worktree(p) if category=='worktrees' else category=='redundant'
 
 def disks():
     mounts = json.loads(subprocess.check_output(['/usr/bin/findmnt','--json','--list',
@@ -440,20 +500,34 @@ def recovery():
 def scan():
     c, live, items = config(), probe(), []
     PREVIOUS.update({x['path']:x for x in read(STATE/'report.json',{}).get('items',[]) if x['category']=='worktrees'})
-    try:
-        system=json.loads(subprocess.check_output(['/usr/bin/sudo','-n',HELPER+'system','preview'],text=True,timeout=30))
-        write(STATE/'system.json',system)
-    except (subprocess.SubprocessError,ValueError):
-        pass
-    def one(p, category):
+    def one(p, category, why=''):
         try:
-            return branch_items(p) if category=='repo' else redundant(live, c) if category=='redundant' else [inventory(p, live, c, category)]
+            if category=='repo': return branch_items(Path(p))
+            item = inventory(Path(p), live, c, category, procs)
+            if why:  # a name heuristic: only worth suggesting when it frees real space (skips 2FA "backup codes", lock files)
+                if item['bytes'] < 1<<20: return []
+                item['detail'] = f"{why} · {idle_days(item['latest'])}d since last change"
+            return [item]
         except (OSError,ValueError,subprocess.SubprocessError) as e:
-            return [] if category=='repo' else [{'id':key(p),'path':str(p),'category':category,'bytes':0,'files':0,'latest':0,
+            return [] if category in ('repo','redundant') else [{'id':key(p),'path':str(p),'category':category,'bytes':0,'files':0,'latest':0,
                           'detail':'','reason':'Unreadable or changed: '+type(e).__name__,'eligible':False}]
-    with concurrent.futures.ThreadPoolExecutor(8) as pool:
-        for rows in pool.map(lambda a: one(*a), list(candidates())):
-            items += rows
+    # Processes do the walking (no GIL); threads wait on them and on git. Items start measuring while the walk still runs.
+    with concurrent.futures.ProcessPoolExecutor(mp_context=multiprocessing.get_context('forkserver'),
+                                                initializer=_init,initargs=(live['refs'],live['mounts'])) as procs, \
+         concurrent.futures.ThreadPoolExecutor(32) as threads:
+        preview = threads.submit(subprocess.check_output,['/usr/bin/sudo','-n',HELPER+'system','preview'],text=True,timeout=30)
+        jobs, notes, big, repos = [threads.submit(one,p,cat) for p,cat in candidates()], {}, [], set()
+        for part in fan_out(procs, discover, walk_roots(c)):
+            jobs += [threads.submit(one,p,cat) for p,cat in part['found']]
+            repos |= {p for p,cat in part['found'] if cat in ('repo','worktrees')}
+            notes |= part['notes']
+            big += part['big']
+        duplicates(notes, big, threads)
+        # Inside a work tree, version- and backup-named files are sources and fixtures: git's business, not ours.
+        jobs += [threads.submit(one,p,'redundant',why) for p,why in notes.items() if not nested(p,notes) and not nested(p,repos)]
+        for job in jobs: items += job.result()
+        try: write(STATE/'system.json',json.loads(preview.result()))
+        except (subprocess.SubprocessError,ValueError): pass
     items.sort(key=lambda x:(x['bytes'],x['latest']), reverse=True)
     report = {'at':time.time(),'config':c,'disks':disks(),'items':items,
               'process_errors':live['errors'],'recovery':recovery(),
@@ -471,7 +545,7 @@ def stage(report, permanent=False, rules=None, ids=None):
     if time.time()-report['at'] > 1800:
         raise ValueError('Preview expired. Scan again before cleaning.')
     c, records, result = (rules or config()), recovery(), {'staged':0,'deleted':0,'bytes':0,'skipped':0,'errors':[]}
-    allowed = {str(p):cat for p,cat in candidates()}
+    allowed, roots = {str(p):cat for p,cat in candidates()}, walk_roots(c)
     live = probe()
     for old in report['items']:
         if ids is not None:
@@ -492,7 +566,7 @@ def stage(report, permanent=False, rules=None, ids=None):
                 if r.returncode: raise ValueError(r.stderr.strip() or 'git branch -d failed')
                 result['deleted'] += 1
                 continue
-            if not p.exists() or (allowed.get(str(p)) != old['category'] if old['category']!='redundant' else not under(str(p),str(HOME))):
+            if not p.exists() or (allowed.get(str(p)) != old['category'] and not walked(str(p),old['category'],roots)):
                 result['skipped'] += 1
                 continue
             now = inventory(p,live,c,old['category'])
@@ -774,7 +848,8 @@ def main():
                 report=scan()
                 if report['process_errors']: raise ValueError('Incomplete process visibility')
                 recover_or_purge('purge',aged=True)
-                stage(report,permanent=c['mode']=='delete')
+                # Duplicates / old versions / backups are user files on every drive: suggested in the panel, never removed unattended.
+                stage(report,permanent=c['mode']=='delete',rules=c|{'categories':[x for x in c['categories'] if x!='redundant']})
                 write(STATE/'last-auto.json',{'at':time.time()})
                 report=scan()
         print(json.dumps(summary(report),separators=(',',':')))

@@ -18,7 +18,7 @@ Open the panel from the bar widget or:
 noctalia msg panel-toggle derpcat/smart-storage:dashboard
 ```
 
-1. **Rescan** builds the inventory (a few seconds warm; the first run walks your home directory).
+1. **Rescan** builds the inventory: your home and every mounted data drive, walked in parallel (a few seconds warm, ~25 s cold for ~3 M files).
 2. Toggle categories in the legend; the pie and the item list follow. Click a legend row to filter the list.
 3. **Delete selected** removes every eligible item in the enabled categories, or **Delete** a single row. With the *stage* mode in Settings, items move to `~/.smart-storage-recovery` for seven days instead.
 4. **System** runs package-cache, Snapper snapshot, `/tmp` and journal cleanup through `pkexec` (graphical admin prompt, nothing stored).
@@ -34,7 +34,7 @@ Every row has a detail line saying what it is and why it is safe to remove (`Car
 | Bun / npm caches | `~/.npm/_cacache`, `_npx`, bun, pnpm store, node-gyp | on |
 | Python / pip / uv caches | `~/.cache/pip`, `~/.cache/uv` | on |
 | Rust / compiler caches | sccache, go-build, cargo registry cache and extracted sources | on |
-| Rust build outputs | every cargo `target/` under your project roots, CI build workspaces | on |
+| Rust build outputs | every cargo `target/` and shared `CARGO_TARGET_DIR` on any scanned drive, CI build workspaces | on |
 | Thumbnails / shaders | thumbnails, mesa shader cache, Steam shader caches (all libraries, named by game) | on |
 | Application logs | `*.log` trees under `~/.cache`, `~/.config`, `~/.local`, runner `_diag` | on |
 | Git worktrees | worktrees whose branch is merged and tree is clean (`git worktree remove`) | off |
@@ -42,12 +42,12 @@ Every row has a detail line saying what it is and why it is safe to remove (`Car
 | Temporary files | your own top-level entries in `/tmp`, `/var/tmp`, `~/tmp` | on |
 | Trash | XDG trash on every scanned mount | off |
 | App caches | Chrome / Zen / Spotify / Thunderbird caches, Chrome on-device AI model, flatpak app caches, Bitwig undo history | off |
-| Duplicates / old versions / backups | `*backup*` / `.bak` / `.old` names, older versioned siblings (`foo-1.0.34` beside `foo-1.0.40`, symlink-aware), archives already extracted next to them, same-content files ≥ 64 MB | off |
+| Duplicates / old versions / backups | `*backup*` / `.bak` / `.old` names, older versioned siblings (`foo-1.0.34` beside `foo-1.0.40`, symlink-aware), archives already extracted next to them, same-content files ≥ 64 MB. Suggestions only: 1 MiB minimum, nothing inside git work trees, one copy of every duplicate always kept, never removed by the schedule | off |
 
-Project roots walked for builds, worktrees and branches: `~/projects ~/Projects ~/src ~/dev ~/code ~/repos ~/work ~/actions-runners ~/.t3/worktrees ~/.codex/worktrees`. Add more in `~/.local/state/smart-storage/config.json`:
+Builds, worktrees, branches and duplicates come from one walk of your home directory plus every mounted data drive: anything mounted outside the system tree (`/usr`, `/var`, `/boot`, …), including removable drives under `/run/media`. Bind mounts of an already-scanned tree are walked once. The walk skips caches, `node_modules`, `.git`, toolchains, Steam libraries, trash and recycle bins. Add directories that are neither in home nor on their own mount in `~/.local/state/smart-storage/config.json`:
 
 ```json
-{"roots": ["/mnt/data/DEV_PROJECTS"]}
+{"roots": ["/srv/work"]}
 ```
 
 ## Requirements
@@ -79,5 +79,5 @@ Sizes are logical estimates. Btrfs compression, reflinks and snapshots mean free
 ## Notes
 
 - Processes: `sudo -n` for the three helpers, `pkexec` for system actions, `git`, `du`, `findmnt`. No network access.
-- The first scan with *Duplicates* enabled walks `~` (about a minute cold on a large home, a few seconds warm).
+- Scans use a process pool (one worker per CPU) that splits every walk, including a single huge item like a cargo registry, into pieces. Items are measured while the walk is still discovering more.
 - Filesystem writes: only under `~/.local/state/smart-storage`, `~/.smart-storage-recovery` and the items you delete.

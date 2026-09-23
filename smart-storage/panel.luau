@@ -87,7 +87,7 @@ end
 local function header()
   local root, others = data.disks[1], {}
   for _,d in ipairs(data.disks) do
-    if d.path=="/" then root=d elseif #others<3 then table.insert(others,short(d.path,14).." "..size(d.free)) end
+    if d.path=="/" then root=d else table.insert(others,short(d.path,14).." "..size(d.free)) end
   end
   local low=root.free/root.total<0.1
   return ui.column({gap=4},{

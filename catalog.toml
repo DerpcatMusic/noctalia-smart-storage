@@ -2,8 +2,8 @@
 [[plugin]]
 id = "derpcat/smart-storage"
 name = "Smart Storage"
-version = "2.1.0"
-updated_at = 1790080187
+version = "2.2.0"
+updated_at = 1790157033
 added_at = 1790080187
 author = "derpcat"
 license = "MIT"
