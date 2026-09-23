@@ -600,7 +600,7 @@ def stage(report, permanent=False, rules=None, ids=None):
                     continue
                 if old['category']=='branches':
                     r = git('branch','-d',old['branch'],cwd=old['repo'])
-                    if r.returncode: raise ValueError(r.stderr.strip() or 'git branch -d failed')
+                    if r.returncode: raise ValueError((r.stderr.strip().splitlines() or ['git branch -d failed'])[0])  # drop git's multi-line -D hint
                     result['deleted'] += 1
                 elif old['category']=='worktrees':
                     # Always permanent. worktree_state() required clean, merged and unlocked; prune drops git's record.
