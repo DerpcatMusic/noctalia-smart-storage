@@ -191,17 +191,17 @@ end
 local function catRow(g,v,count)
   local expanded=open==g.id
   local heldBytes=v[1]-v[2]
-  local amount=g.id=="branches" and (count.." branches") or size(v[2])
+  local amount=g.id=="branches" and (count.." branches") or size(v[2]>0 and v[2] or v[1])
   return ui.row({key="cat|"..g.id,gap=8,align="center",paddingH=6,paddingV=3,radius=6,
-    fill=(expanded or (hover and hover.cat==g.id)) and "surface_variant" or nil},{
-    ui.row({width=12,height=12,radius=3,fill=g.enabled and g.color or nil,border=g.color,borderWidth=2,
+    fill=(expanded or (hover and hover.cat==g.id)) and "surface_variant" or "surface_variant/0"},{
+    ui.row({width=12,height=12,radius=3,fill=g.enabled and g.color or "surface_variant/0",border=g.color,borderWidth=2,
       tooltip=g.enabled and "Selected · click to leave out of Delete" or "Click to include in Delete",
       onClick=function() toggleCategory(g,not g.enabled) end},{}),
     ui.row({flexGrow=1,gap=8,align="center",onHover=hoverOn({key="cat|"..g.id,cat=g.id}),
       onClick=function() open=(not expanded) and g.id or nil;confirm=nil;render() end},{
       text(g.label,v[2]>0 and "on_surface" or "on_surface_variant",12,{flexGrow=1,maxLines=1}),
-      text(heldBytes>0 and (size(heldBytes).." "..why(g.why)) or "","on_surface_variant",11,{maxLines=1}),
-      ui.row({width=64,justify="end"},{text(amount,v[2]>0 and "primary" or "on_surface_variant",12)}),
+      text(heldBytes>0 and ((v[2]>0 and (size(heldBytes).." ") or "")..why(g.why)) or "","on_surface_variant",11,{maxLines=1}),
+      ui.row({width=84,justify="end"},{text(amount,v[2]>0 and "primary" or "on_surface_variant",12)}),
       ui.glyph({name=expanded and "chevron-down" or "chevron-right",size=14,color="on_surface_variant"})})})
 end
 
@@ -213,7 +213,7 @@ local function itemRow(x)
     ui.row({width=12},{}),
     text(isBranch and string.gsub(x.path,"^.*#","") or short(x.path,64),x.eligible and "on_surface" or "on_surface_variant",11,{flexGrow=1,maxLines=1}),
     text(x.eligible and "" or why(x.reason),"on_surface_variant",11,{maxLines=1}),
-    ui.row({width=64,justify="end"},{text(isBranch and "" or size(x.bytes),"on_surface_variant",11)}),
+    ui.row({width=84,justify="end"},{text(isBranch and "" or size(x.bytes),"on_surface_variant",11)}),
     ui.button({glyph=not sure and "trash" or nil,text=sure and "Sure?" or nil,variant=sure and "destructive" or "ghost",controlSize="sm",
       tooltip=isBranch and "git branch -d" or (data.config.mode=="delete" and "Delete" or "Move to recovery folder"),
       enabled=x.eligible and not busy,onClick=function() if sure then remove(x.id) else confirm=x.id;render() end end})})
@@ -267,11 +267,11 @@ local function items()
   end
   if not d or d.path=="/" then
     local expanded=open=="system"
-    table.insert(rows,ui.row({key="cat|system",gap=8,align="center",paddingH=6,paddingV=3,radius=6,fill=expanded and "surface_variant" or nil,
+    table.insert(rows,ui.row({key="cat|system",gap=8,align="center",paddingH=6,paddingV=3,radius=6,fill=(expanded or (hover and hover.cat=="system")) and "surface_variant" or "surface_variant/0",
       onHover=hoverOn({key="cat|system",cat="system"}),onClick=function() open=(not expanded) and "system" or nil;confirm=nil;render() end},{
       ui.glyph({name="shield-lock",size=12,color="on_surface_variant"}),
       text("System (admin)","on_surface",12,{flexGrow=1}),
-      ui.row({width=64,justify="end"},{text(size(systemBytes()),"on_surface_variant",12)}),
+      ui.row({width=84,justify="end"},{text(size(systemBytes()),"on_surface_variant",12)}),
       ui.glyph({name=expanded and "chevron-down" or "chevron-right",size=14,color="on_surface_variant"})}))
     if expanded then for _,r in ipairs(systemRows()) do table.insert(rows,r) end end
   end
@@ -284,13 +284,13 @@ local function settings()
   local rows={}
   local function choices(label,opts,current,fn)
     local b={}
-    for _,o in ipairs(opts) do table.insert(b,button(o[2],function() fn(o[1]) end,current==o[1] and "primary" or "ghost")) end
+    for _,o in ipairs(opts) do table.insert(b,button(o[2],function() fn(o[1]) end,current==o[1] and "primary" or "ghost",nil,{key=label..o[2]..tostring(current==o[1])})) end
     table.insert(rows,ui.row({gap=8,align="center"},{ui.column({width=150},{text(label,"on_surface",12)}),ui.row({gap=4},b)}))
   end
   choices("Removal",{{"delete","Permanent"},{"stage","Recovery folder, 7 days"}},c.mode,function(v) configure("--mode "..v,function(cc) cc.mode=v end) end)
   choices("Skip if changed within",{{0,"never"},{1,"1 d"},{7,"7 d"},{30,"30 d"},{90,"90 d"}},c.age_days,function(v) configure("--age "..v,function(cc) cc.age_days=v end) end)
   choices("Automatic run",{{0,"off"},{1,"daily"},{7,"weekly"},{30,"monthly"}},c.schedule_days,function(v) configure("--schedule "..v,function(cc) cc.schedule_days=v end) end)
-  table.insert(rows,ui.row({gap=8,align="center"},{text("Recovery folder · "..size(data.recovery_bytes).." · "..data.recovery_count.." items","on_surface",12,{flexGrow=1}),
+  table.insert(rows,ui.row({gap=8,align="center"},{text(data.recovery_count>0 and ("Recovery folder · "..size(data.recovery_bytes).." · "..data.recovery_count.." items") or "Recovery folder · empty","on_surface",12,{flexGrow=1}),
     mutate("Restore",function() run("restore") end,"secondary",data.recovery_count>0),
     mutate(confirm=="purge" and "Sure?" or "Empty",function() if confirm=="purge" then run("purge") else confirm="purge";render() end end,"destructive",data.recovery_count>0)}))
   for _,e in ipairs(data.last_action and data.last_action.errors or {}) do table.insert(rows,text(short(e,120),"error",11)) end
