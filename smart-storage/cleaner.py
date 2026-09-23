@@ -525,19 +525,24 @@ def move_aside(p):
         p.rename(dest)
         return paths+[dest]
     journal(add)
+    reap_later()  # space comes back while the rest is still being checked
 
 def reap():
     """Background: delete what move_aside() renamed. One reaper at a time; a later spawn waits, then re-checks."""
     with (STATE/'reaper.lock').open('w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         while paths := read(REAP,[]):
-            for p in paths:
-                if os.path.basename(p).startswith('.smart-storage-deleting-'):  # only ever what move_aside() made
-                    subprocess.run(['/usr/bin/rm','-rf','--one-file-system','--',p],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            with concurrent.futures.ThreadPoolExecutor(8) as threads:
+                threads.map(lambda p: subprocess.run(['/usr/bin/rm','-rf','--one-file-system','--',p],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL),
+                            [p for p in paths if os.path.basename(p).startswith('.smart-storage-deleting-')])  # only ever what move_aside() made
             left = journal(lambda j: [p for p in j if os.path.lexists(p)])
             if set(paths) <= set(left): return  # nothing removable this pass; the next spawn retries
 
 def reap_later():
+    """Start the background remover unless one is running. Detached, so closing the panel never stops it."""
+    with (STATE/'reaper.lock').open('a') as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: return  # a running reaper re-reads the journal until it is empty
     subprocess.Popen([sys.executable,str(Path(__file__).resolve()),'reap'],start_new_session=True,
                      stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 
@@ -819,6 +824,8 @@ def main():
             except (ValueError,OSError):
                 job['error']='Task ended without a complete result; scan again.'
         out['job']=job
+        out['pending']=len(read(REAP,[]))
+        if out['pending']: reap_later()  # resumes a removal that was interrupted (killed, crash, reboot)
         print(json.dumps(out,separators=(',',':')))
         return
     if args.action == 'start':

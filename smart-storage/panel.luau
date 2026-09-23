@@ -1,5 +1,5 @@
 local data, render, refresh, run
-local busy, polling, lastStatus, deleting, hidden = false, false, "", false, {}
+local busy, polling, lastStatus, pending, hidden = false, false, "", false, {}
 local view, filter, message, confirm = "items", nil, "", nil
 local HOME = noctalia.expandPath("~")
 local function quote(s) return "'"..string.gsub(s,"'","'\\''").."'" end
@@ -25,7 +25,7 @@ local function button(label,fn,variant,enabled,extra)
   if extra then for k,v in pairs(extra) do o[k]=v end end
   return ui.button(o)
 end
-local function mutate(label,fn,variant,enabled) return button(label,fn,variant,enabled~=false and not busy and not deleting) end
+local function mutate(label,fn,variant,enabled) return button(label,fn,variant,enabled~=false and not busy) end
 
 -- Status polling: only re-render when the backend output actually changed.
 refresh=function()
@@ -39,7 +39,8 @@ refresh=function()
     local d=noctalia.json.decode(out)
     if r.exitCode~=0 or not d or d.error then message=d and d.error or "Status unavailable"
     else
-      data=d;busy=d.job and d.job.running or false
+      data=d;busy=d.job and d.job.running or false;pending=(d.pending or 0)>0
+      if not busy then hidden={} end  -- the finished job's report no longer has what it removed
       message=busy and ("Running "..d.job.operation.."… you can close this panel.") or ""
       if not busy and d.job and d.job.error and d.job.error~="" then message=d.job.error end
       if not busy and d.last_action and d.last_action.at and d.last_action.at>(d.at or 0)-60 then
@@ -47,6 +48,7 @@ refresh=function()
         message=string.format("Last run: %d removed, %d staged, %d skipped · %s freed",a.deleted or 0,a.staged or 0,a.skipped or 0,size(a.bytes))
         if a.errors and #a.errors>0 then message=message.." · "..#a.errors.." errors (see Settings)" end
       end
+      if not busy and pending then message="Removing "..d.pending.." items in the background…" end
     end
     render()
   end)
@@ -57,7 +59,7 @@ run=function(action,extra)
   busy=true;confirm=nil;message="Starting "..action.."…";render()
   noctalia.runAsync(cleaner("start --operation "..action..(extra or "")),function(r)
     local d=noctalia.json.decode(r.stdout or "")
-    if r.exitCode~=0 then busy=false;message=d and d.error or "Could not start";render() else lastStatus="";refresh() end
+    if r.exitCode~=0 then busy=false;hidden={};message=d and d.error or "Could not start";render() else lastStatus="";refresh() end
   end)
 end
 -- Settings changes are instant: local state first, then a direct (non-job) configure.
@@ -78,21 +80,16 @@ local function toggleCategory(g,on)
   end
   configure("--categories "..quote(table.concat(ids,",")),function(c) c.categories=ids end)
 end
--- Deleting is a direct call (renames, well under a second plus the live-use probe): rows vanish at once,
--- the backend's reply brings the real state, and anything it skipped comes back.
+-- Deleting is a detached job, so closing the panel never cuts it short: rows vanish at once, the finished job's
+-- report brings the real state (anything it skipped comes back), and the reaper frees the space behind it.
 local function remove(id)
-  if busy or deleting then return end
+  if busy then return end
   local on={}
   for _,g in ipairs(data.groups) do on[g.id]=g.enabled end
   for _,x in ipairs(data.items) do
     if x.id==id or (not id and x.eligible and on[x.category]) then hidden[x.id]=true end
   end
-  deleting=true;confirm=nil;message="Deleting…";render()
-  noctalia.runAsync(cleaner((data.config.mode=="delete" and "delete" or "stage")..(id and " --ids "..id or "")),function(r)
-    local d=noctalia.json.decode(r.stdout or "")
-    deleting=false;hidden={};lastStatus=""
-    if r.exitCode~=0 or not d or d.error then message=d and d.error or "Delete failed";render() else refresh() end
-  end)
+  run(data.config.mode=="delete" and "delete" or "stage",id and " --ids "..id or "")
 end
 local function eligibleTotal()
   local n=0
@@ -146,7 +143,7 @@ local function itemRow(x)
       text(isBranch and "branch" or size(x.bytes),"primary",12),
       button(sure and "Sure?" or (isBranch and "git branch -d" or (data.config.mode=="delete" and "Delete" or "Stage")),
         function() if sure then remove(x.id) else confirm=x.id;render() end end,
-        sure and "destructive" or "ghost",x.eligible and not busy and not deleting)}),
+        sure and "destructive" or "ghost",x.eligible and not busy)}),
     text((x.reason~="" and x.reason.."  ·  " or "")..(x.detail or ""),x.reason~="" and "error" or "on_surface_variant",11,{maxLines=1})})
 end
 
@@ -214,7 +211,7 @@ render=function()
     ui.scroll({flexGrow=1},{ui.column({gap=4},body)})}))
 end
 function onOpen() panel.setWantsSecondTicks(true);lastStatus="";refresh() end
-function update() if busy then refresh() end end
+function update() if busy or pending then refresh() end end
 function onIpc(event,payload)
   if event=="scan" then run("scan") elseif event=="view" then view=payload;render() else lastStatus="";refresh() end
 end

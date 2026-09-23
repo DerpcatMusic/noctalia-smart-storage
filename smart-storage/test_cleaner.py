@@ -35,6 +35,7 @@ if __name__ == '__main__':  # pool workers re-import this file; only the parent 
         # Staging reuses a folder's fingerprint after the move; deleting is a rename now and a reap later.
         cleaner.STATE, cleaner.REAP = d/'state', d/'state/reap.json'
         cleaner.STATE.mkdir()
+        cleaner.reap_later = lambda: None  # a spawned reaper would use the real state dir
         (d/'tree').rename(d/'moved')
         assert cleaner.inventory(d/'moved', live, cleaner.DEFAULT, 'temp')['fingerprint'] == inline['fingerprint']
         cleaner.move_aside(d/'moved')
