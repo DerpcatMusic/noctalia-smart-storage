@@ -18,9 +18,10 @@ TOOLS = {
  'packages': {'pacman','paru','yay','shelly','makepkg','bsdtar'},
  'javascript': {'bun','npm','pnpm','yarn'},
  'python': {'pip','pip3','uv'},
- 'rust': {'cargo','rustc','sccache','rustup','clang','gcc','cc','cmake','ninja','make'},
+ 'rust': {'cargo','rustc','rust-analyzer'},  # registry readers; sccache and go-build are keyed in GUARDS
  'builds': {'cargo','rustc','clang','gcc','cc','cmake','ninja','make'},
  'desktop': {'steam','gamescope'}, 'logs': set(), 'worktrees': set(), 'branches': set(), 'temp': set(), 'trash':set(), 'apps':set(), 'redundant':set()}
+GUARDS = {'sccache': set(), 'go-build': {'go'}}  # sccache treats a vanished entry as a miss
 DEFAULT = {'age_days':0, 'schedule_days':0, 'categories':[x for x in LABELS if x not in ('trash','worktrees','branches','apps','redundant')], 'pins':[], 'mode':'stage',
            'roots':[]}  # roots: extra directories to walk besides home and mounted drives (config.json only)
 SYSTEM = ('/boot','/efi','/usr','/var','/tmp','/root','/srv','/opt','/etc','/dev','/proc','/sys','/run','/home','/nix','/snap')
@@ -285,8 +286,9 @@ def note(part, p, name, s, root, dev):
         part['reason'] = 'In use: open file, mapped binary or working directory'
     if name in ('.keepbuild','.keepstorage'):
         part['reason'] = 'Contains a keep marker'
-    if not isdir and not stat.S_ISLNK(mode) and not stat.S_ISREG(mode):
-        part['reason'] = 'Contains sockets or special files'
+    # A bound socket is in the probe's paths; an unbound one (a dead daemon's) is just an inode.
+    if not isdir and not stat.S_ISLNK(mode) and not stat.S_ISREG(mode) and not stat.S_ISSOCK(mode):
+        part['reason'] = 'Contains FIFOs or device files'
     if stat.S_ISREG(mode) and s.st_nlink > 1:  # hard links count once; reclaimable only when every link is inside
         part['links'].setdefault((s.st_dev,s.st_ino),[s.st_blocks*512,0,s.st_nlink])[1] += 1
     else:
@@ -323,9 +325,10 @@ def inventory(path, live, c, category, pool=None):
     if any(under(p, str(path)) for p in live['paths']):
         reason = 'In use: open file, binary, working directory or argument'
     # Tool-wide guards cover lazily opened cache files, beyond open descriptors.
-    if category not in ('builds','worktrees') and any(n.lower() in TOOLS[category] for n in live['names']):
+    if category not in ('builds','worktrees') and any(n.lower() in GUARDS.get(path.parent.name, TOOLS[category]) for n in live['names']):
         reason = 'Protected while related tools are running'
-    if category=='builds' and (path.parent/'Cargo.toml').exists() and any(under(p,str(path.parent)) for p in live['paths']):
+    # A shell or editor sitting in the project isn't building; only a cargo/rustc working there is.
+    if category=='builds' and (path.parent/'Cargo.toml').exists() and any(under(p,str(path.parent)) for p in live.get('building',live['paths'])):
         reason = 'Project is in use'
     extra = {}
     if category == 'worktrees':
