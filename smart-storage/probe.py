@@ -3,8 +3,21 @@
 import json, os
 from pathlib import Path
 
+def mount_paths(proc):
+    """Host paths behind a process's mounts. Rootless containers hide their cwd and open files even from root,
+    so a hidden process protects everything it has mounted from the host instead of blocking every cleanup."""
+    host = [l.split() for l in Path('/proc/self/mountinfo').read_text().splitlines()]
+    out = set()
+    for f in (l.split() for l in (proc/'mountinfo').read_text().splitlines()):
+        for h in host:  # same device, and the host mount's root contains the process mount's root
+            if h[2] == f[2] and (f[3] == h[3] or f[3].startswith(h[3].rstrip('/')+'/')):
+                out.add('/'+os.path.normpath((h[4]+'/'+f[3][len(h[3]):]).replace('\\040',' ')).lstrip('/'))
+    return out
+
+BUILDERS = {'cargo', 'rustc', 'clippy-driver', 'build-script-bu'}  # comm is cut to 15 chars
+
 def snapshot():
-    refs, paths, names, errors = set(), set(), set(), []
+    refs, paths, names, errors, building = set(), set(), set(), [], set()
     for proc in Path('/proc').iterdir():
         if not proc.name.isdecimal() or int(proc.name) == os.getpid():
             continue
@@ -13,6 +26,7 @@ def snapshot():
                 continue
             comm = (proc / 'comm').read_text().strip()
             names.add(comm)
+            hidden = []
             def reference(p):
                 try:
                     s = p.stat()
@@ -22,10 +36,16 @@ def snapshot():
                         paths.add(target.removesuffix(' (deleted)'))
                 except (FileNotFoundError, ProcessLookupError):
                     pass
+                except PermissionError:
+                    hidden.append(p)
             for kind in ('cwd', 'exe', 'root'):
                 reference(proc / kind)
             for fd in (proc / 'fd').iterdir():
                 reference(fd)
+            if hidden:
+                paths.update(mount_paths(proc))
+            if comm in BUILDERS and not hidden:
+                building.add(os.readlink(proc/'cwd'))
             for line in (proc / 'maps').read_text().splitlines():
                 fields = line.split(None, 5)
                 if len(fields) >= 5 and int(fields[4]):
@@ -65,7 +85,7 @@ def snapshot():
         fields=line.split(None,7)
         if len(fields)==8 and fields[7].startswith('/'):
             paths.add(fields[7])
-    return {'refs': sorted(refs), 'paths': sorted(paths), 'names': sorted(names), 'errors': errors}
+    return {'refs': sorted(refs), 'paths': sorted(paths), 'names': sorted(names), 'errors': errors, 'building': sorted(building)}
 
 if __name__ == '__main__':
     print(json.dumps(snapshot()))
