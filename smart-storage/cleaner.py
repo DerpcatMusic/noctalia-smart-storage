@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """Smart Storage: explicit disposable roots, live-use checks and reversible staging."""
-import argparse, concurrent.futures, fcntl, hashlib, json, math, multiprocessing, os, re, shutil, stat, struct, subprocess, sys, time, uuid, zlib
+import argparse, collections, concurrent.futures, fcntl, hashlib, json, multiprocessing, os, re, shutil, stat, struct, subprocess, sys, time, uuid
 from pathlib import Path
 
 HOME = Path.home()
@@ -12,8 +12,8 @@ DAY = 86400
 LABELS = {'packages':'AUR package downloads', 'javascript':'Bun / npm caches',
           'python':'Python / pip / uv caches', 'rust':'Rust / compiler caches',
           'builds':'Rust build outputs', 'desktop':'Thumbnails / shaders', 'logs':'Application logs',
-          'worktrees':'Git worktrees (merged, clean)', 'branches':'Stale git branches', 'temp':'Temporary files', 'trash':'Trash / recycle bins',
-          'apps':'App caches (opt-in)', 'redundant':'Duplicates / old versions / backups (opt-in)'}
+          'worktrees':'Git worktrees', 'branches':'Stale git branches', 'temp':'Temporary files', 'trash':'Trash / recycle bins',
+          'apps':'App caches', 'redundant':'Duplicates, old versions, backups'}
 TOOLS = {
  'packages': {'pacman','paru','yay','shelly','makepkg','bsdtar'},
  'javascript': {'bun','npm','pnpm','yarn'},
@@ -487,19 +487,19 @@ def walked(p, category, roots):
     return is_target(p) if category=='builds' else is_worktree(p) if category=='worktrees' else category=='redundant'
 
 def disks():
-    mounts = json.loads(subprocess.check_output(['/usr/bin/findmnt','--json','--list',
-                        '-o','TARGET,SOURCE,FSTYPE'],text=True))['filesystems']
-    result, seen = [], set()
-    for m in mounts:
-        if m['fstype'] not in ('btrfs','ext4','xfs','ntfs','ntfs3','fuseblk'):
+    """Each filesystem once (btrfs subvolumes share a device), plus /tmp when it lives in RAM. 'mounts' lists
+    every mount point of the filesystem, so summary() can put each item on the disk that actually holds it."""
+    result = {}
+    for m in json.loads(subprocess.check_output(['/usr/bin/findmnt','--json','--list','-o','TARGET,SOURCE,FSTYPE'],text=True))['filesystems']:
+        ram = m['fstype']=='tmpfs' and m['target']=='/tmp'
+        if m['fstype'] not in ('btrfs','ext4','xfs','ntfs','ntfs3','fuseblk','exfat') and not ram:
             continue
         source = m['source'].split('[')[0]
-        if source in seen:
-            continue
-        seen.add(source)
-        s = shutil.disk_usage(m['target'])
-        result.append({'path':m['target'],'source':source,'total':s.total,'used':s.used,'free':s.free})
-    return result
+        if source not in result:
+            s = shutil.disk_usage(m['target'])
+            result[source] = {'path':m['target'],'source':source,'total':s.total,'used':s.used,'free':s.free,'ram':ram,'mounts':[]}
+        result[source]['mounts'].append(m['target'])
+    return list(result.values())
 
 def recovery():
     return read(STATE/'recovery.json',[])
@@ -725,41 +725,6 @@ def recover_or_purge(action, aged=False):
     write(STATE/'last-action.json',result)
     return result
 
-def png(size, rows):
-    def chunk(t, d): return struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff)
-    return (b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',size,size,8,6,0,0,0))
-            +chunk(b'IDAT',zlib.compress(b''.join(b'\x00'+r for r in rows),6))+chunk(b'IEND',b''))
-
-def pie_png(groups):
-    """Donut of bytes per category as a cached PNG for ui.image (no chart primitive in the plugin UI)."""
-    slices = [(g['bytes'],g['color']) for g in groups if g['bytes']>0]
-    if not slices: return ''
-    out = STATE/('pie-'+hashlib.sha256(json.dumps(slices).encode()).hexdigest()[:12]+'.png')
-    if out.exists(): return str(out)
-    N, SS = 200, 2
-    size = N*SS; cx = size/2; R = cx-SS; r0 = R*0.6
-    total = sum(b for b,_ in slices); acc = 0.0; bounds = []
-    for b,col in slices:
-        acc += b/total; bounds.append((acc, bytes.fromhex(col.lstrip('#'))))
-    rows = []
-    for y in range(N):
-        row = bytearray()
-        for x in range(N):
-            r=g=b=h=0
-            for sy in range(SS):
-                for sx in range(SS):
-                    px, py = x*SS+sx+0.5-cx, y*SS+sy+0.5-cx
-                    d = math.hypot(px,py)
-                    if r0 <= d <= R:
-                        frac = (math.atan2(py,px)/(2*math.pi)+0.25) % 1.0
-                        col = next((col for bound,col in bounds if frac <= bound), bounds[-1][1])
-                        r+=col[0]; g+=col[1]; b+=col[2]; h+=1
-            row += bytes((r//h, g//h, b//h, 255*h//(SS*SS))) if h else b'\0\0\0\0'
-        rows.append(bytes(row))
-    for old in STATE.glob('pie-*.png'): old.unlink()
-    out.write_bytes(png(N, rows))
-    return str(out)
-
 def aged(items, c):
     if not c['age_days']: return items
     cut = time.time()-c['age_days']*DAY
@@ -775,16 +740,27 @@ def summary(report):
     theme = read(HOME/'.config/noctalia/colors.json',{})
     palette = [shade(theme.get(name,'#8899aa'),k) for k in (0,-0.35,0.4,-0.6) for name in COLORS]
     items = aged(report.get('items',[]), c)
-    groups, shown, per = [], [], {}
+    drives = disks()
+    where = sorted(((m,d) for d in drives for m in d['mounts']), key=lambda t: -len(t[0]))
+    for d in drives: d['cats'] = {}
+    groups, shown, per, why = [], [], {}, collections.defaultdict(collections.Counter)
+    for x in items:
+        d = next((d for m,d in where if under(x['path'],m)), None)
+        ready = x.get('reclaimable',x['bytes']) if x['eligible'] else 0
+        if d:  # per disk and category: [bytes, ready to free]
+            x['disk'] = d['path']
+            b, e = d['cats'].get(x['category'],(0,0))
+            d['cats'][x['category']] = (b+x['bytes'], e+ready)
+        if not x['eligible']: why[x['category']][x['reason']] += x['bytes'] or 1
+        n = per.get(x['category'],0)
+        if n < 60: shown.append(x); per[x['category']] = n+1  # ponytail: 60 rows per category; paginate when someone actually has more
     for i,(cat,label) in enumerate(LABELS.items()):
         rows = [x for x in items if x['category']==cat]
         groups.append({'id':cat,'label':label,'bytes':sum(x['bytes'] for x in rows),'color':palette[i],
                       'eligible':sum(x.get('reclaimable',x['bytes']) for x in rows if x['eligible']),
-                      'count':len(rows),'enabled':cat in c['categories']})
-    for x in items:  # ponytail: 60 rows per category; paginate when someone actually has more
-        n = per.get(x['category'],0)
-        if n < 60: shown.append(x); per[x['category']] = n+1
-    return {'at':report.get('at',0),'config':c,'disks':disks(),'groups':groups,'pie':pie_png(groups),
+                      'count':len(rows),'enabled':cat in c['categories'],
+                      'why':why[cat].most_common(1)[0][0] if why[cat] else ''})  # what holds most of the rest back
+    return {'at':report.get('at',0),'config':c,'disks':drives,'groups':groups,
             'items':shown,'item_count':len(items),
             'eligible':sum(g['eligible'] for g in groups if g['enabled']),
             'recovery_bytes':sum(r['bytes'] for r in recovery()),'recovery_count':len(recovery()),
