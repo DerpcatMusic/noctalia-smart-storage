@@ -283,7 +283,8 @@ def describe(path, category, item):
         for needle, what in (('OptGuideOnDeviceModel','Chrome on-device AI model · re-downloaded if the feature is used'),
                              ('buffr/capture','BUFFR capture spill buffers'), ('plugin-undo','Bitwig plugin-state undo history · only undo steps are lost'), ('session-artifacts','Prime agent session artifacts'),
                              ('winetricks','winetricks download cache · re-downloaded'), ('.var/app','flatpak app cache'),
-                             ('/.debug/','perf build-id cache · only old perf recordings lose symbols')):
+                             ('/.debug/','perf build-id cache · only old perf recordings lose symbols'),
+                             ('.pre-','pre-upgrade copy of '+name.split('.pre-')[0]+' · the upgraded one is in use')):
             if needle in s: return f"{what} · {item['files']} files · {age}"
         return f"{parent} cache · regenerates · {age}"
     if category=='deps':
@@ -431,10 +432,15 @@ def candidates():
             for child in sorted(p.iterdir()):
                 if not child.name.startswith('.smart-storage') and not child.is_symlink():
                     yield child, cat
-    for p in (HOME/'.cache').iterdir():  # discovery skips .cache; tools park CARGO_TARGET_DIRs there
+    for p in (HOME/'.cache').iterdir():  # discovery skips .cache; tools park CARGO_TARGET_DIRs there, one level down too
         if p.is_dir() and not p.is_symlink():
             if cargo_target(p): yield p,'builds'
-            elif 'target' in p.name: yield from ((q,'builds') for q in p.iterdir() if q.is_dir() and not q.is_symlink() and cargo_target(q))
+            else: yield from ((q,'builds') for q in p.iterdir() if q.is_dir() and not q.is_symlink() and cargo_target(q))
+    # An app's copy of its database from before an upgrade ('state.sqlite.pre-0.0.43'), a week after the upgrade.
+    for base in (HOME/'.t3/userdata', *HOME.glob('.config/*'), *HOME.glob('.local/share/*')):
+        for f in base.glob('*.pre-*') if base.is_dir() and not base.is_symlink() else ():
+            if (f.parent/f.name.split('.pre-')[0]).is_file() and f.is_file() and not f.is_symlink() and time.time()-f.stat().st_mtime > 7*DAY:
+                yield f,'apps'
     for root in trash_roots():
         if root.name.startswith('S-1-'):
             yield root,'trash'
