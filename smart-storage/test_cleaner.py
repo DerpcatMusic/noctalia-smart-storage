@@ -62,10 +62,16 @@ if __name__ == '__main__':  # pool workers re-import this file; only the parent 
         assert notes == {s+'/Song/auto-backups':'Bitwig auto-backups', s+'/Song Project/Backup':'Ableton project backups'}, notes
         assert cleaner.walked(s+'/Song/auto-backups','redundant',[s]) and not cleaner.walked(s+'/Vox/Backup','redundant',[s])
     print('ok')
-import tempfile
+import tempfile, os
 with tempfile.TemporaryDirectory() as t:  # cargo 1.98 targets: tag, no .rustc_info.json; a foreign tag is not cargo's
     tag = pathlib.Path(t,'CACHEDIR.TAG')
     tag.write_text('Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n')
     assert cleaner.cargo_target(t)
     tag.write_text('Signature: 8a477f597d28d172789f06886806bc55\n# created by ccache\n')
     assert not cleaner.cargo_target(t)
+with tempfile.TemporaryDirectory() as t:  # node_modules counts only beside a lockfile
+    for d in ('a/node_modules/x','b/node_modules/x'): pathlib.Path(t,d).mkdir(parents=True)
+    pathlib.Path(t,'a/bun.lock').touch()
+    found, stack = cleaner.discover([t])
+    while stack: more, stack = cleaner.discover(stack); found['found'] += more['found']
+    assert [(os.path.relpath(p,t),c) for p,c in found['found']] == [('a/node_modules','deps')], found

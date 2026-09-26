@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """Smart Storage: explicit disposable roots, live-use checks and reversible staging."""
-import argparse, collections, concurrent.futures, fcntl, functools, hashlib, json, multiprocessing, os, re, shutil, stat, struct, subprocess, sys, time, uuid
+import argparse, collections, concurrent.futures, fcntl, functools, hashlib, json, multiprocessing, os, re, shutil, stat, struct, subprocess, sys, threading, time, uuid
 from pathlib import Path
 
 HOME = Path.home()
@@ -13,14 +13,14 @@ LABELS = {'packages':'AUR package downloads', 'javascript':'Bun / npm caches',
           'python':'Python / pip / uv caches', 'rust':'Rust / compiler caches',
           'builds':'Rust build outputs', 'desktop':'Thumbnails / shaders', 'logs':'Application logs',
           'worktrees':'Git worktrees', 'branches':'Stale git branches', 'temp':'Temporary files', 'trash':'Trash / recycle bins',
-          'apps':'App caches', 'redundant':'DAW project backups'}
+          'apps':'App caches', 'redundant':'DAW project backups', 'deps':'node_modules (reinstall from lockfile)'}
 TOOLS = {
  'packages': {'pacman','paru','yay','shelly','makepkg','bsdtar'},
  'javascript': {'bun','npm','pnpm','yarn'},
  'python': {'pip','pip3','uv'},
  'rust': {'cargo','rustc','rust-analyzer'},  # registry readers; sccache and go-build are keyed in GUARDS
  'builds': {'cargo','rustc','clang','gcc','cc','cmake','ninja','make'},
- 'desktop': {'steam','gamescope'}, 'logs': set(), 'worktrees': set(), 'branches': set(), 'temp': set(), 'trash':set(), 'apps':set(), 'redundant':set()}
+ 'desktop': {'steam','gamescope'}, 'logs': set(), 'worktrees': set(), 'branches': set(), 'temp': set(), 'trash':set(), 'apps':set(), 'redundant':set(), 'deps':set()}
 GUARDS = {'sccache': set(), 'go-build': {'go'}}  # sccache treats a vanished entry as a miss
 DEFAULT = {'age_days':0, 'schedule_days':0, 'categories':[x for x in LABELS if x not in ('trash','worktrees','branches','apps','redundant')], 'pins':[], 'mode':'stage',
            'roots':[]}  # roots: extra directories to walk besides home and mounted drives (config.json only)
@@ -34,6 +34,7 @@ SKIP = {'.git','node_modules','.cache','.rustup','.cargo','flatpak','containers'
         'Trash','$RECYCLE.BIN','$Recycle.Bin','System Volume Information','lost+found'}  # trash has its own category
 INSTALLED = re.compile(r'/drive_c/(windows|ProgramData|Program Files( \(x86\))?|users/[^/]+/AppData)$')  # installed software, not user copies
 BUDGET, SPLIT = 4000, 4  # entries per pool task; pieces an unfinished walk is split into
+LOCKS = {'bun.lock','bun.lockb','package-lock.json','pnpm-lock.yaml','yarn.lock'}  # node_modules is reinstallable only beside one
 MASK = (1<<128)-1
 UID = os.getuid()
 PREVIOUS = {}  # last report's worktree rows; ineligible worktrees reuse their size while git state is unchanged
@@ -125,15 +126,29 @@ def default_ref(repo):
 def idle_days(ts):
     return int((time.time()-ts)//DAY) if ts else 0
 
-@functools.cache
 def merged_heads(repo):
     """Head commits of the repo's merged GitHub PRs. A squash merge leaves the branch out of main's history, but a
     worktree whose HEAD is exactly a merged PR's head has landed everything. No gh or no network: nothing counts."""
+    url = git('remote','get-url','origin',cwd=repo).stdout.strip()
+    return _merged_heads(url) if 'github.com' in url else frozenset()
+
+HEADS_LOCK = threading.Lock()
+
+@functools.cache
+def _merged_heads(url):
+    # Many clones and worktrees share one GitHub repo, and a merged PR stays merged: ask gh once an hour per repo.
+    with HEADS_LOCK:
+        cached = read(STATE/'merged-heads.json',{}).get(url)
+    if cached and time.time()-cached[0] < 3600: return frozenset(cached[1])
     try:
-        r = subprocess.run(['gh','pr','list','--state','merged','--limit','1000','--json','headRefOid'],
-                           cwd=repo,capture_output=True,text=True,timeout=30,check=False)
-        return frozenset(x['headRefOid'] for x in json.loads(r.stdout)) if r.returncode == 0 else frozenset()
-    except (OSError,ValueError,subprocess.SubprocessError): return frozenset()
+        r = subprocess.run(['gh','pr','list','-R',url,'--state','merged','--limit','1000','--json','headRefOid'],
+                           capture_output=True,text=True,timeout=30,check=False)
+        heads = [x['headRefOid'] for x in json.loads(r.stdout)] if r.returncode == 0 else None
+    except (OSError,ValueError,subprocess.SubprocessError): heads = None
+    if heads is None: return frozenset(cached[1]) if cached else frozenset()
+    with HEADS_LOCK:
+        write(STATE/'merged-heads.json', read(STATE/'merged-heads.json',{}) | {url:[time.time(),heads]})
+    return frozenset(heads)
 
 def worktree_state(path):
     """Linked worktree: eligible only when clean and HEAD is already in the default branch."""
@@ -161,7 +176,7 @@ def branch_items(repo):
     items = []
     for line in git('for-each-ref','--format=%(refname:short) %(objectname) %(committerdate:unix)','refs/heads',cwd=repo).stdout.splitlines():
         name, sha, ts = line.split(); idle = idle_days(int(ts))
-        is_merged = name in merged and name != base.split('/')[-1]
+        is_merged = (name in merged or sha in merged_heads(str(repo))) and name != base.split('/')[-1]
         if not is_merged and idle < 30: continue
         reason = 'Checked out in a worktree' if name in used else '' if is_merged else 'Not merged; listed only'
         items.append({'id':key(f'{repo}#{name}'),'path':f'{repo}#{name}','repo':str(repo),'branch':name,'category':'branches',
@@ -238,6 +253,9 @@ def discover(stack):
         for e in entries:
             if e.is_symlink() or e.name.startswith('.smart-storage'): continue  # recovery vaults, trees being reaped
             p, isdir = e.path, e.is_dir(follow_symlinks=False)
+            if isdir and e.name == 'node_modules' and LOCKS & names:
+                found.append((p,'deps'))
+                continue
             if isdir and (why := app_backup(e.name, names)):
                 notes[p] = why
                 continue
@@ -264,9 +282,14 @@ def describe(path, category, item):
     if category=='apps':
         for needle, what in (('OptGuideOnDeviceModel','Chrome on-device AI model · re-downloaded if the feature is used'),
                              ('buffr/capture','BUFFR capture spill buffers'), ('plugin-undo','Bitwig plugin-state undo history · only undo steps are lost'), ('session-artifacts','Prime agent session artifacts'),
-                             ('winetricks','winetricks download cache · re-downloaded'), ('.var/app','flatpak app cache')):
+                             ('winetricks','winetricks download cache · re-downloaded'), ('.var/app','flatpak app cache'),
+                             ('/.debug/','perf build-id cache · only old perf recordings lose symbols')):
             if needle in s: return f"{what} · {item['files']} files · {age}"
         return f"{parent} cache · regenerates · {age}"
+    if category=='deps':
+        lock = next((f for f in sorted(LOCKS) if (path.parent/f).exists()), '')
+        tool = {'bun.lock':'bun','bun.lockb':'bun','package-lock.json':'npm','pnpm-lock.yaml':'pnpm','yarn.lock':'yarn'}.get(lock,'npm')
+        return f"packages of {path.parent.name} · {tool} install restores them · {age}"
     if category=='python': return parent+' cache · re-downloaded on install · '+age
     if category=='desktop':
         if parent=='shadercache': return 'Steam shader cache · '+steam_name(name)+' · rebuilt while playing · '+age
@@ -345,6 +368,8 @@ def inventory(path, live, c, category, pool=None):
     # A shell or editor sitting in the project isn't building; only a cargo/rustc working there is.
     if category=='builds' and (path.parent/'Cargo.toml').exists() and any(under(p,str(path.parent)) for p in live.get('building',live['paths'])):
         reason = 'Project is in use'
+    if category=='deps' and any(under(p,str(path.parent)) for p in live['paths']):
+        reason = 'Project is in use'  # a dev server imports lazily; any process working in the project keeps its packages
     extra = {}
     if category == 'worktrees':
         wreason, extra['detail'], extra['main'], extra['state'] = worktree_state(path)
@@ -398,7 +423,7 @@ def candidates():
       'apps':[HOME/'.config/google-chrome/OptGuideOnDeviceModel',HOME/'.cache/google-chrome',HOME/'.cache/google-chrome-headless',
               HOME/'.cache/google-chrome-for-testing-headless',HOME/'.cache/zen',HOME/'.cache/spotify',HOME/'.cache/winetricks',
               HOME/'.cache/thunderbird',HOME/'.cache/codex-desktop',HOME/'.prime/agent/session-artifacts',HOME/'.cache/buffr/capture',
-              HOME/'.BitwigStudio/plugin-undo',HOME/'.BitwigStudio/cache',
+              HOME/'.BitwigStudio/plugin-undo',HOME/'.BitwigStudio/cache',HOME/'.debug',  # ~/.debug: perf's build-id cache
               *HOME.glob('.var/app/*/cache')]}
     def children(p, cat):
         p = p.resolve()
@@ -406,6 +431,10 @@ def candidates():
             for child in sorted(p.iterdir()):
                 if not child.name.startswith('.smart-storage') and not child.is_symlink():
                     yield child, cat
+    for p in (HOME/'.cache').iterdir():  # discovery skips .cache; tools park CARGO_TARGET_DIRs there
+        if p.is_dir() and not p.is_symlink():
+            if cargo_target(p): yield p,'builds'
+            elif 'target' in p.name: yield from ((q,'builds') for q in p.iterdir() if q.is_dir() and not q.is_symlink() and cargo_target(q))
     for root in trash_roots():
         if root.name.startswith('S-1-'):
             yield root,'trash'
@@ -618,8 +647,10 @@ def stage(report, permanent=False, rules=None, ids=None):
                     result['skipped'] += 1
                     continue
                 if old['category']=='branches':
-                    r = git('branch','-d',old['branch'],cwd=old['repo'])
-                    if r.returncode: raise ValueError((r.stderr.strip().splitlines() or ['git branch -d failed'])[0])  # drop git's multi-line -D hint
+                    # Merged into the default branch (or a merged PR's head) was just re-verified; git branch -d would
+                    # instead ask about whatever branch happens to be checked out. The old sha guards against a moved ref.
+                    r = git('update-ref','-d','refs/heads/'+old['branch'],old['fingerprint'],cwd=old['repo'])
+                    if r.returncode: raise ValueError((r.stderr.strip().splitlines() or ['git update-ref -d failed'])[0])
                     result['deleted'] += 1
                 elif old['category']=='worktrees':
                     # Always permanent. worktree_state() required clean, merged and unlocked; prune drops git's record.
