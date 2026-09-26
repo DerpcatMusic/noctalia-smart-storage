@@ -62,3 +62,10 @@ if __name__ == '__main__':  # pool workers re-import this file; only the parent 
         assert notes == {s+'/Song/auto-backups':'Bitwig auto-backups', s+'/Song Project/Backup':'Ableton project backups'}, notes
         assert cleaner.walked(s+'/Song/auto-backups','redundant',[s]) and not cleaner.walked(s+'/Vox/Backup','redundant',[s])
     print('ok')
+import tempfile
+with tempfile.TemporaryDirectory() as t:  # cargo 1.98 targets: tag, no .rustc_info.json; a foreign tag is not cargo's
+    tag = pathlib.Path(t,'CACHEDIR.TAG')
+    tag.write_text('Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n')
+    assert cleaner.cargo_target(t)
+    tag.write_text('Signature: 8a477f597d28d172789f06886806bc55\n# created by ccache\n')
+    assert not cleaner.cargo_target(t)

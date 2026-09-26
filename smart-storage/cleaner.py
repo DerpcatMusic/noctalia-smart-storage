@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """Smart Storage: explicit disposable roots, live-use checks and reversible staging."""
-import argparse, collections, concurrent.futures, fcntl, hashlib, json, multiprocessing, os, re, shutil, stat, struct, subprocess, sys, time, uuid
+import argparse, collections, concurrent.futures, fcntl, functools, hashlib, json, multiprocessing, os, re, shutil, stat, struct, subprocess, sys, time, uuid
 from pathlib import Path
 
 HOME = Path.home()
@@ -125,6 +125,16 @@ def default_ref(repo):
 def idle_days(ts):
     return int((time.time()-ts)//DAY) if ts else 0
 
+@functools.cache
+def merged_heads(repo):
+    """Head commits of the repo's merged GitHub PRs. A squash merge leaves the branch out of main's history, but a
+    worktree whose HEAD is exactly a merged PR's head has landed everything. No gh or no network: nothing counts."""
+    try:
+        r = subprocess.run(['gh','pr','list','--state','merged','--limit','1000','--json','headRefOid'],
+                           cwd=repo,capture_output=True,text=True,timeout=30,check=False)
+        return frozenset(x['headRefOid'] for x in json.loads(r.stdout)) if r.returncode == 0 else frozenset()
+    except (OSError,ValueError,subprocess.SubprocessError): return frozenset()
+
 def worktree_state(path):
     """Linked worktree: eligible only when clean and HEAD is already in the default branch."""
     main = str(Path(git('rev-parse','--path-format=absolute','--git-common-dir',cwd=path).stdout.strip()).parent)
@@ -133,6 +143,7 @@ def worktree_state(path):
     base = default_ref(path)
     merged = bool(base) and git('merge-base','--is-ancestor','HEAD',base,cwd=path).returncode == 0
     head, ts = (git('log','-1','--format=%H %ct',cwd=path).stdout.split() or ['',0])[:2]
+    merged = merged or bool(head) and head in merged_heads(main)
     idle = idle_days(int(ts))
     try:
         with open(path/'.git') as f: locked = os.path.exists(os.path.join(path, f.read().partition('gitdir:')[2].strip(), 'locked'))
@@ -176,12 +187,14 @@ def steam_name(appid):
     return _steam.get(appid, 'app '+appid)
 
 def cargo_target(p):
-    # cargo writes .rustc_info.json at the target root and .fingerprint under each profile; CI targets lack CACHEDIR.TAG
+    # cargo tags the target root (cargo 1.98 dropped .rustc_info.json there); CI targets lack the tag but keep
+    # .rustc_info.json at the root and .fingerprint under each profile
     p = Path(p)
     try:
-        if not (p/'.rustc_info.json').is_file(): return False
-        if (p/'CACHEDIR.TAG').read_text().startswith('Signature: 8a477f597d28d172789f06886806bc55'): return True
+        tag = (p/'CACHEDIR.TAG').read_text()[:200]
+        if tag.startswith('Signature: 8a477f597d28d172789f06886806bc55') and 'created by cargo' in tag: return True
     except (OSError,UnicodeError): pass
+    if not (p/'.rustc_info.json').is_file(): return False
     try:
         return any(e.is_dir() and os.path.isdir(os.path.join(e.path,'.fingerprint')) for e in os.scandir(p))
     except OSError: return False
@@ -216,7 +229,7 @@ def discover(stack):
         except OSError: continue
         n += len(entries)+1
         names = {e.name for e in entries}
-        if ('.rustc_info.json' in names or os.path.basename(d).startswith('target')) and is_target(d):
+        if ({'.rustc_info.json','CACHEDIR.TAG'} & names or os.path.basename(d).startswith('target')) and is_target(d):
             found.append((d,'builds'))
             continue
         if '.git' in names:
@@ -282,7 +295,9 @@ def note(part, p, name, s, root, dev):
         return False
     if s.st_uid != UID:
         part['reason'] = 'Not entirely owned by this user'
-    if (s.st_dev,s.st_ino) in REFS:
+    # A hard-linked file (bun links one workerd into every node_modules) is in use here only if its path is; the
+    # probe's paths cover that. Its inode alone would mark every tree sharing it.
+    if (s.st_dev,s.st_ino) in REFS and (isdir or s.st_nlink == 1):
         part['reason'] = 'In use: open file, mapped binary or working directory'
     if name in ('.keepbuild','.keepstorage'):
         part['reason'] = 'Contains a keep marker'
@@ -333,6 +348,7 @@ def inventory(path, live, c, category, pool=None):
     extra = {}
     if category == 'worktrees':
         wreason, extra['detail'], extra['main'], extra['state'] = worktree_state(path)
+        extra['state'].append(rootstat.st_mtime_ns)  # a target removed or created inside changes the root: re-measure
         reason = reason or wreason
         old = PREVIOUS.get(str(path))
         if reason and old and old.get('state') == extra['state']:
