@@ -13,7 +13,7 @@ assert set(cleaner.DEFAULT['categories']).isdisjoint({'trash','worktrees','branc
 if __name__ == '__main__':  # pool workers re-import this file; only the parent builds trees
     import concurrent.futures, multiprocessing, os, tempfile
     from pathlib import Path
-    live = {'errors':[],'paths':[],'names':[],'refs':set(),'mounts':set()}
+    live = {'errors':[],'paths':{},'names':[],'refs':{},'mounts':set()}
     with tempfile.TemporaryDirectory() as t:
         d = Path(t)
         # Pool walk splits into pieces (> BUDGET entries) and must match the inline walk stage() re-checks with.
@@ -75,3 +75,7 @@ with tempfile.TemporaryDirectory() as t:  # node_modules counts only beside a lo
     found, stack = cleaner.discover([t])
     while stack: more, stack = cleaner.discover(stack); found['found'] += more['found']
     assert [(os.path.relpath(p,t),c) for p,c in found['found']] == [('a/node_modules','deps')], found
+with tempfile.TemporaryDirectory() as t:  # an in-use item names its holder
+    live = {'errors':[],'paths':{t+'/x/a.log':'cargo (42)'},'names':[],'refs':{},'mounts':set()}
+    pathlib.Path(t,'x').mkdir()
+    assert cleaner.inventory(pathlib.Path(t,'x'), live, cleaner.DEFAULT, 'temp')['reason'].startswith('In use by cargo (42)')

@@ -97,12 +97,18 @@ def probe():
         try: return open(f'/proc/{pid}/comm').read().strip()+f' ({pid})'
         except OSError: return e
     p['errors'] = [who(e) for e in p['errors']]
-    p['refs'] = {tuple(r) for r in p['refs']}
+    p['refs'] = {(r[0],r[1]): r[2] if len(r) > 2 else '' for r in p['refs']}  # an older helper sends no holder
+    for k in ('paths','building'):
+        if isinstance(p.get(k), list): p[k] = dict.fromkeys(p[k], '')
     p['mounts'] = {m['target'] for m in mounts()}
     return p
 
 def key(path):
     return hashlib.sha256(os.fsencode(path)).hexdigest()[:20]
+
+def holder(paths, root):
+    """Who holds something at or under root ('cargo (1234)'), or None."""
+    return next((w or 'a process' for p,w in paths.items() if under(p,root)), None)
 
 def under(path, parent):
     return path == parent or path.startswith(parent.rstrip('/') + '/')
@@ -159,6 +165,9 @@ def worktree_state(path):
     merged = bool(base) and git('merge-base','--is-ancestor','HEAD',base,cwd=path).returncode == 0
     head, ts = (git('log','-1','--format=%H %ct',cwd=path).stdout.split() or ['',0])[:2]
     merged = merged or bool(head) and head in merged_heads(main)
+    # Rebased or cherry-picked in: every commit has a patch-identical twin in the base ('-' lines only).
+    merged = merged or bool(base) and bool(head) and not any(
+        l.startswith('+') for l in git('cherry',base,head,cwd=path).stdout.splitlines())
     idle = idle_days(int(ts))
     try:
         with open(path/'.git') as f: locked = os.path.exists(os.path.join(path, f.read().partition('gitdir:')[2].strip(), 'locked'))
@@ -322,7 +331,7 @@ def note(part, p, name, s, root, dev):
     # A hard-linked file (bun links one workerd into every node_modules) is in use here only if its path is; the
     # probe's paths cover that. Its inode alone would mark every tree sharing it.
     if (s.st_dev,s.st_ino) in REFS and (isdir or s.st_nlink == 1):
-        part['reason'] = 'In use: open file, mapped binary or working directory'
+        part['reason'] = f"In use by {REFS[(s.st_dev,s.st_ino)] or 'a process'}: open file, mapped binary or working directory"
     if name in ('.keepbuild','.keepstorage'):
         part['reason'] = 'Contains a keep marker'
     # A bound socket is in the probe's paths; an unbound one (a dead daemon's) is just an inode.
@@ -361,16 +370,16 @@ def inventory(path, live, c, category, pool=None):
         reason = 'Symlink ancestor; protected'
     if live['errors']:
         reason = 'Blocked: cannot see inside '+', '.join(live['errors'][:2])+'; runs again when it exits'
-    if any(under(p, str(path)) for p in live['paths']):
-        reason = 'In use: open file, binary, working directory or argument'
+    if who := holder(live['paths'], str(path)):
+        reason = f'In use by {who}: open file, binary, working directory or argument'
     # Tool-wide guards cover lazily opened cache files, beyond open descriptors.
     if category not in ('builds','worktrees') and any(n.lower() in GUARDS.get(path.parent.name, TOOLS[category]) for n in live['names']):
         reason = 'Protected while related tools are running'
     # A shell or editor sitting in the project isn't building; only a cargo/rustc working there is.
-    if category=='builds' and (path.parent/'Cargo.toml').exists() and any(under(p,str(path.parent)) for p in live.get('building',live['paths'])):
-        reason = 'Project is in use'
-    if category=='deps' and any(under(p,str(path.parent)) for p in live['paths']):
-        reason = 'Project is in use'  # a dev server imports lazily; any process working in the project keeps its packages
+    if category=='builds' and (path.parent/'Cargo.toml').exists() and (who := holder(live.get('building',live['paths']),str(path.parent))):
+        reason = f'Project is in use by {who}'
+    if category=='deps' and (who := holder(live['paths'],str(path.parent))):
+        reason = f'Project is in use by {who}'  # a dev server imports lazily; any process working in the project keeps its packages
     extra = {}
     if category == 'worktrees':
         wreason, extra['detail'], extra['main'], extra['state'] = worktree_state(path)
@@ -526,7 +535,9 @@ def recovery():
 
 def walkers(live):
     """Process pool for walks (started on first use); forkserver workers get the probe snapshot through _init."""
-    return concurrent.futures.ProcessPoolExecutor(mp_context=multiprocessing.get_context('forkserver'),
+    # ponytail: a quarter of the cores; walks are I/O-bound and builds usually want the rest
+    return concurrent.futures.ProcessPoolExecutor(max_workers=max(2,(os.cpu_count() or 4)//4),
+                                                  mp_context=multiprocessing.get_context('forkserver'),
                                                   initializer=_init,initargs=(live['refs'],live['mounts']))
 
 def journal(change):
@@ -620,7 +631,8 @@ def scan():
     write(STATE/'report.json',report)
     return report
 
-def stage(report, permanent=False, rules=None, ids=None):
+def stage(report, permanent=False, rules=None, ids=None, force=False):
+    """force (only for items picked by id, confirmed twice in the panel): skip the in-use, merged and changed checks."""
     if time.time()-report['at'] > 1800:
         raise ValueError('Preview expired. Scan again before cleaning.')
     c, records, result = (rules or config()), recovery(), {'staged':0,'deleted':0,'bytes':0,'skipped':0,'errors':[],'removed':[]}
@@ -631,7 +643,7 @@ def stage(report, permanent=False, rules=None, ids=None):
             if old['id'] not in ids: continue
         elif not old['eligible'] or old['category'] not in c['categories']:
             continue
-        if c['age_days'] and time.time()-old.get('latest',0) < c['age_days']*DAY:
+        if not force and c['age_days'] and time.time()-old.get('latest',0) < c['age_days']*DAY:
             result['skipped'] += 1
             continue
         todo.append(old)
@@ -649,7 +661,7 @@ def stage(report, permanent=False, rules=None, ids=None):
             p = Path(old['path'])
             try:
                 now = check.result()
-                if not now or not now['eligible'] or now['fingerprint'] != old['fingerprint']:
+                if not now or not force and (not now['eligible'] or now['fingerprint'] != old['fingerprint']):
                     result['skipped'] += 1
                     continue
                 if old['category']=='branches':
@@ -765,7 +777,8 @@ def summary(report):
     c = config()
     theme = read(HOME/'.config/noctalia/colors.json',{})
     palette = [shade(theme.get(name,'#8899aa'),k) for k in (0,-0.35,0.4,-0.6) for name in COLORS]
-    items = aged(report.get('items',[]), c)
+    # Something else (targone, a shell, another tool) may have removed an item since the scan: don't show ghosts.
+    items = aged([x for x in report.get('items',[]) if os.path.lexists(x.get('repo',x['path']))], c)
     drives = disks()
     where = sorted(((m,d) for d in drives for m in d['mounts']), key=lambda t: -len(t[0]))
     for d in drives: d['cats'] = {}
@@ -806,10 +819,14 @@ def main():
     parser.add_argument('--schedule',type=int,choices=[0,1,7,30])
     parser.add_argument('--categories')
     parser.add_argument('--ids')
+    parser.add_argument('--force',action='store_true',help='with --ids: remove even if in use, unmerged or changed')
     args=parser.parse_args()
     if os.getuid()==0:
         raise ValueError('The cleaner must run as your normal user')
     STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
+    if args.action != 'status':  # every heavy entry point (panel, widget, timer) yields CPU and disk to real work
+        os.nice(15)
+        subprocess.run(['ionice','-c3','-p',str(os.getpid())],check=False,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     if args.action == 'status':
         out=summary(read(STATE/'report.json',{}))
         job=read(STATE/'job.json',{})
@@ -845,6 +862,7 @@ def main():
             for name in ('age','schedule','categories','path','mode','kind','ids'):
                 value=getattr(args,name)
                 if value is not None: command += ['--'+name,str(value)]
+            if args.force: command.append('--force')
             with (STATE/'job-output.json').open('w') as output:
                 child=subprocess.Popen(command,stdout=output,stderr=output,start_new_session=True)
             write(STATE/'job.json',{'pid':child.pid,'operation':args.operation,'at':time.time()})
@@ -898,7 +916,8 @@ def main():
                   {'at':time.time(),'results':results})
         elif args.action in ('stage','delete'):
             if not report: raise ValueError('Scan before cleaning')
-            report=forget(report,stage(report,permanent=args.action=='delete',ids=set(args.ids.split(',')) if args.ids else None))
+            report=forget(report,stage(report,permanent=args.action=='delete',ids=set(args.ids.split(',')) if args.ids else None,
+                                       force=args.force and bool(args.ids)))
         elif args.action in ('restore','purge'):
             recover_or_purge(args.action)
             if args.action=='restore': report=scan()
