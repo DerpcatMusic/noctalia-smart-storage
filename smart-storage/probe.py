@@ -17,7 +17,7 @@ def mount_paths(proc):
 BUILDERS = {'cargo', 'rustc', 'clippy-driver', 'build-script-bu'}  # comm is cut to 15 chars
 
 def snapshot():
-    refs, paths, names, errors, building = set(), set(), set(), [], set()
+    refs, paths, names, errors, building = {}, {}, set(), [], {}  # path/inode -> 'comm (pid)' of a holder
     for proc in Path('/proc').iterdir():
         if not proc.name.isdecimal() or int(proc.name) == os.getpid():
             continue
@@ -26,39 +26,41 @@ def snapshot():
                 continue
             comm = (proc / 'comm').read_text().strip()
             names.add(comm)
+            who = f'{comm} ({proc.name})'
             hidden = []
             def reference(p):
                 try:
                     s = p.stat()
-                    refs.add((s.st_dev, s.st_ino))
+                    refs.setdefault((s.st_dev, s.st_ino), who)
                     target = os.readlink(p)
                     if target.startswith('/'):
-                        paths.add(target.removesuffix(' (deleted)'))
+                        paths.setdefault(target.removesuffix(' (deleted)'), who)
                 except (FileNotFoundError, ProcessLookupError):
                     pass
                 except PermissionError:
                     hidden.append(p)
-            for kind in ('cwd', 'exe', 'root'):
+            # sccache's daemon keeps the cwd of whichever cargo first started it and never uses it.
+            for kind in ('exe', 'root') if comm == 'sccache' else ('cwd', 'exe', 'root'):
                 reference(proc / kind)
             for fd in (proc / 'fd').iterdir():
                 reference(fd)
             if hidden:
-                paths.update(mount_paths(proc))
+                for m in mount_paths(proc): paths.setdefault(m, who)
             if comm in BUILDERS and not hidden:
-                building.add(os.readlink(proc/'cwd'))
+                building.setdefault(os.readlink(proc/'cwd'), who)
             for line in (proc / 'maps').read_text().splitlines():
                 fields = line.split(None, 5)
                 if len(fields) >= 5 and int(fields[4]):
                     major, minor = (int(n, 16) for n in fields[3].split(':'))
-                    refs.add((os.makedev(major, minor), int(fields[4])))
+                    refs.setdefault((os.makedev(major, minor), int(fields[4])), who)
                     if len(fields) == 6 and fields[5].startswith('/'):
-                        paths.add(fields[5].removesuffix(' (deleted)'))
+                        paths.setdefault(fields[5].removesuffix(' (deleted)'), who)
             # Only these cache/build path variables are observed; never emit environment contents.
             for raw in (proc/'environ').read_bytes().split(b'\0'):
                 name,_,value=raw.partition(b'=')
                 if name in (b'CARGO_TARGET_DIR',b'CARGO_HOME',b'npm_config_cache',b'BUN_INSTALL_CACHE_DIR',b'UV_CACHE_DIR',b'SCCACHE_DIR',b'TMPDIR'):
                     path=os.fsdecode(value)
-                    if path.startswith('/') and Path(path).exists(): paths.add(str(Path(path).resolve()))
+                    if path.startswith('/') and Path(path).exists(): paths.setdefault(str(Path(path).resolve()), who)
             # Resolve only existing file arguments; never emit command lines or environments.
             args = (proc / 'cmdline').read_bytes().split(b'\0')[1:]
             for arg in args:
@@ -71,9 +73,9 @@ def snapshot():
                 p = Path(value) if value.startswith('/') else proc / 'cwd' / value
                 try:
                     if p.exists() and p.is_absolute():
-                        paths.add(str(p.resolve()))
+                        paths.setdefault(str(p.resolve()), who)
                         s = p.stat()
-                        refs.add((s.st_dev, s.st_ino))
+                        refs.setdefault((s.st_dev, s.st_ino), who)
                 except (OSError, ValueError):
                     pass
         except (FileNotFoundError, ProcessLookupError):
@@ -84,8 +86,9 @@ def snapshot():
     for line in Path('/proc/net/unix').read_text().splitlines()[1:]:
         fields=line.split(None,7)
         if len(fields)==8 and fields[7].startswith('/'):
-            paths.add(fields[7])
-    return {'refs': sorted(refs), 'paths': sorted(paths), 'names': sorted(names), 'errors': errors, 'building': sorted(building)}
+            paths.setdefault(fields[7], 'a socket')
+    return {'refs': [[*k, w] for k, w in sorted(refs.items())], 'paths': paths, 'names': sorted(names), 'errors': errors,
+            'building': building}
 
 if __name__ == '__main__':
     print(json.dumps(snapshot()))

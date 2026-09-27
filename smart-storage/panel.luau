@@ -38,6 +38,8 @@ local WHY={{"^In use","in use"},{"^Protected while","tool running"},{"^Project i
 local function why(r)
   local who=string.match(r,"^Blocked: cannot see inside ([^;]+)")
   if who then return "blocked by "..who end
+  who=string.match(r,"in use by ([^:]+)") or string.match(r,"In use by ([^:]+)")
+  if who then return "used by "..who end
   for _,w in ipairs(WHY) do if string.find(r,w[1]) then return w[2] end end
   return string.lower(r)
 end
@@ -100,14 +102,14 @@ local function toggleCategory(g,on)
 end
 -- Deleting is a detached job, so closing the panel never cuts it short: rows vanish at once, the finished job's
 -- report brings the real state (anything it skipped comes back), and the reaper frees the space behind it.
-local function remove(id)
+local function remove(id,force)
   if busy then return end
   local on={}
   for _,g in ipairs(data.groups) do on[g.id]=g.enabled end
   for _,x in ipairs(data.items) do
     if x.id==id or (not id and x.eligible and on[x.category]) then hidden[x.id]=true end
   end
-  run(data.config.mode=="delete" and "delete" or "stage",id and " --ids "..id or "")
+  run(data.config.mode=="delete" and "delete" or "stage",id and (" --ids "..id..(force and " --force" or "")) or "")
 end
 local function selectedTotal()
   local n=0
@@ -215,8 +217,8 @@ local function itemRow(x)
     text(x.eligible and "" or why(x.reason),"on_surface_variant",11,{maxLines=1}),
     ui.row({width=84,justify="end"},{text(isBranch and "" or size(x.bytes),"on_surface_variant",11)}),
     ui.button({glyph=not sure and "trash" or nil,text=sure and "Sure?" or nil,variant=sure and "destructive" or "ghost",controlSize="sm",
-      tooltip=isBranch and "git branch -d" or (data.config.mode=="delete" and "Delete" or "Move to recovery folder"),
-      enabled=x.eligible and not busy,onClick=function() if sure then remove(x.id) else confirm=x.id;render() end end})})
+      tooltip=(x.eligible and "" or "Force: "..why(x.reason).." · ")..(isBranch and "delete branch" or (data.config.mode=="delete" and "Delete" or "Move to recovery folder")),
+      enabled=not busy,onClick=function() if sure then remove(x.id,not x.eligible) else confirm=x.id;render() end end})})
 end
 
 local function systemRows()
