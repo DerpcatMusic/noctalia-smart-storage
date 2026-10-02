@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
-    name: Safe checks
+  ci:
+    name: CI
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -33,15 +33,3 @@ jobs:
           test_home=$(mktemp -d)
           trap 'rm -rf -- "$test_home"' EXIT
           HOME="$test_home" python test_cleaner.py
-
-  ci:
-    name: CI
-    if: ${{ always() }}
-    needs: checks
-    runs-on: ubuntu-24.04
-    timeout-minutes: 2
-    steps:
-      - name: Require all checks
-        env:
-          CHECKS_RESULT: ${{ needs.checks.result }}
-        run: test "$CHECKS_RESULT" = success
