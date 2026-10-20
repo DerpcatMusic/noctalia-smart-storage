@@ -2,8 +2,13 @@ name: CI
 
 on:
   pull_request:
+    # Markdown is not an input to the static checks or the cleaner tests.
+    paths-ignore:
+      - '**/*.md'
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
   workflow_dispatch:
 
 permissions:
